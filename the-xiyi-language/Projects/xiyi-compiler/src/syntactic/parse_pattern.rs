@@ -1,7 +1,7 @@
 // src/syntactic/parse_pattern.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // ===== parse_pattern（支持绑定） =====

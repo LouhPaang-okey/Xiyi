@@ -1,7 +1,7 @@
 // src/syntactic/parse_attr.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // ===== 属性解析 =====
@@ -68,14 +68,23 @@ impl Parser {
                     }
                 } else {
                     self.next();
-                    let num = int_part.parse().unwrap();
+                    // 词法层只保证这一串字符"看起来像整数"，不保证真的
+                    // parse 得出来（比如位数超出目标整数类型能表示的
+                    // 范围）。unwrap 会让这种情况直接 panic 掉整个编译器
+                    // 进程，改成如实报错。
+                    let num = int_part.parse().map_err(|_| {
+                        format!("Invalid integer attribute value: {}", int_part)
+                    })?;
                     Ok(AttributeArg::Int(num))
                 }
             }
             Some((Token::Float, v)) => {
                 let v = v.clone();
                 self.next();
-                Ok(AttributeArg::Float(v.parse().unwrap()))
+                let num = v.parse().map_err(|_| {
+                    format!("Invalid float attribute value: {}", v)
+                })?;
+                Ok(AttributeArg::Float(num))
             }
             _ => Err("Expected attribute argument value".to_string()),
         }

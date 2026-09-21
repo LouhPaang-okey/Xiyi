@@ -1,7 +1,7 @@
 // src/syntactic/parse_model.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // 原名 parse_model_def，按要求改名为 parse_model。

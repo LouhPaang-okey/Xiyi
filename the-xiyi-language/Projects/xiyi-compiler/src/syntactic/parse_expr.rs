@@ -1,7 +1,7 @@
 // src/syntactic/parse_expr.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // ===== 表达式解析 =====
@@ -316,46 +316,18 @@ impl Parser {
             // ===== 处理 self（方法调用接收者） =====
             Some((Token::SelfLower, _)) => {
                 self.next(); // consume 'self'
-                let mut expr = Expr {
+                let expr = Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Ident("self".to_string()),
                 };
-                // 处理点链 .xxx 或 .xxx()
-                while let Some((Token::Dot, _)) = self.peek() {
-                    self.next();
-                    let field_name = self.parse_ident()?;
-                    if let Some((Token::LParen, _)) = self.peek() {
-                        self.next();
-                        let args = self.parse_call_args()?;
-                        self.expect(Token::RParen)?;
-                        let mut all_args = vec![CallArg::Positional(expr)];
-                        all_args.extend(args);
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::Call {
-                                qualifier: None,
-                                func: field_name,
-                                args: all_args,
-                                is_method: true,
-                            },
-                        };
-                    } else {
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::FieldAccess {
-                                struct_expr: Box::new(expr),
-                                field_name,
-                            },
-                        };
-                    }
-                }
-                Ok(expr)
+                // 点链 .xxx 或 .xxx() 统一交给 parse_dot_chain 处理。
+                self.parse_dot_chain(expr)
             }
             // ===== SelfType 分支 =====
             Some((Token::SelfType, _)) => {
                 self.next(); // consume 'Self'
 
-                let mut expr = if let Some((Token::LBrace, _)) = self.peek() {
+                let expr = if let Some((Token::LBrace, _)) = self.peek() {
                     self.next(); // consume '{'
                     let fields = self.parse_struct_fields()?;
                     Expr {
@@ -372,36 +344,7 @@ impl Parser {
                     }
                 };
 
-                // 处理点链
-                while let Some((Token::Dot, _)) = self.peek() {
-                    self.next();
-                    let field_name = self.parse_ident()?;
-                    if let Some((Token::LParen, _)) = self.peek() {
-                        self.next();
-                        let args = self.parse_call_args()?;
-                        self.expect(Token::RParen)?;
-                        let mut all_args = vec![CallArg::Positional(expr)];
-                        all_args.extend(args);
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::Call {
-                                qualifier: None,
-                                func: field_name,
-                                args: all_args,
-                                is_method: true,
-                            },
-                        };
-                    } else {
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::FieldAccess {
-                                struct_expr: Box::new(expr),
-                                field_name,
-                            },
-                        };
-                    }
-                }
-                Ok(expr)
+                self.parse_dot_chain(expr)
             }
             Some((Token::Unsafe, _)) => {
                 let unsafe_stmt = self.parse_unsafe_block()?;
@@ -475,80 +418,23 @@ impl Parser {
                     if let Some((Token::LBrace, _)) = self.peek() {
                     self.next(); // consume '{'
                     let fields = self.parse_struct_fields()?;
-                    let mut expr = Expr {
+                    let expr = Expr {
                         id: self.next_expr_id(),
                         kind: ExprKind::StructInit {
                             struct_name: name.clone(),
                             fields,
                         },
                     };
-                    // 处理点链
-                    while let Some((Token::Dot, _)) = self.peek() {
-                        self.next();
-                        let field_name = self.parse_ident()?;
-                        if let Some((Token::LParen, _)) = self.peek() {
-                            self.next();
-                            let args = self.parse_call_args()?;
-                            self.expect(Token::RParen)?;
-                            let mut all_args = vec![CallArg::Positional(expr)];
-                            all_args.extend(args);
-                            expr = Expr {
-                                id: self.next_expr_id(),
-                                kind: ExprKind::Call {
-                                    qualifier: None,
-                                    func: field_name,
-                                    args: all_args,
-                                    is_method: true,
-                                },
-                            };
-                        } else {
-                            expr = Expr {
-                                id: self.next_expr_id(),
-                                kind: ExprKind::FieldAccess {
-                                    struct_expr: Box::new(expr),
-                                    field_name,
-                                },
-                            };
-                        }
-                    }
-                    return Ok(expr);
+                    return self.parse_dot_chain(expr);
                     }
                 }
 
                 // 普通标识符 + 点链
-                let mut expr = Expr {
+                let expr = Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Ident(name),
                 };
-                while let Some((Token::Dot, _)) = self.peek() {
-                    self.next();
-                    let field_name = self.parse_ident()?;
-                    if let Some((Token::LParen, _)) = self.peek() {
-                        self.next();
-                        let args = self.parse_call_args()?;
-                        self.expect(Token::RParen)?;
-                        let mut all_args = vec![CallArg::Positional(expr)];
-                        all_args.extend(args);
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::Call {
-                                qualifier: None,
-                                func: field_name,
-                                args: all_args,
-                                is_method: true,
-                            },
-                        };
-                    } else {
-                        expr = Expr {
-                            id: self.next_expr_id(),
-                            kind: ExprKind::FieldAccess {
-                                struct_expr: Box::new(expr),
-                                field_name,
-                            },
-                        };
-                    }
-                }
-                Ok(expr)
+                self.parse_dot_chain(expr)
             }
             // 关键：try_parse_unit_literal 已经在函数开头把 `()` 这种
             // 情况处理掉了，走到这里的 LParen 一定不是单元字面量，直接
@@ -585,22 +471,66 @@ impl Parser {
                 })
             }
             _ => {
-                eprintln!("Unexpected token: {:?} at position {}", self.peek(), self.pos);
-                eprintln!("Context (5 tokens before):");
-                for i in 0..5 {
-                    if self.pos > i {
-                        let idx = self.pos - i - 1;
-                        eprintln!("  {:?}", self.tokens.get(idx));
-                    }
-                }
-                eprintln!("Current token: {:?}", self.tokens.get(self.pos));
-                eprintln!("Next 5 tokens:");
-                for i in 1..=5 {
-                    eprintln!("  {:?}", self.tokens.get(self.pos + i));
-                }
-                Err("Expected expression".to_string())
+                // 关键修复：原来这里在报错前用一串 eprintln! 把当前
+                // token、前 5 个、后 5 个全部倒到 stderr，再返回一句
+                // 跟这些信息毫无关联的 "Expected expression"——调试时
+                // 留下的痕迹，真正返回给调用方的错误反而丢了这些
+                // 上下文。跟其它几处调试输出一个毛病：编译真实程序会
+                // 刷屏，而且信息没有跟着 Err 走，调用方拿到的错误
+                // 反而更少。现在把当前 token 和位置直接折进 Err
+                // 本身，不再往 stderr 单独倒东西。
+                Err(format!(
+                    "Expected expression, found {:?} at position {}",
+                    self.peek(),
+                    self.pos
+                ))
             }
         }
+    }
+
+    // ===== 点链：`.field` / `.method(args)` 连续访问 =====
+    // 从 parse_primary 的 SelfLower、SelfType、Ident（含 Ident 分支内部
+    // 走结构体初始化那条路）四个位置抽出来的公共逻辑——原来这四处各自
+    // 内联一份逐字符相同的 while 循环，以后想改点链的规则（比如支持
+    // `?.` 之类）要同时改四个地方，容易漏改。现在四处各自只负责构造好
+    // 点链要作用的初始 expr，剩下的全部交给这一个函数。
+    //
+    // 项目约定不使用任何 Rust 宏（包括 matches!），is_call 的判断用
+    // 显式 match 写，不走 matches! 宏。
+    pub(crate) fn parse_dot_chain(&mut self, mut expr: Expr) -> Result<Expr, String> {
+        while let Some((Token::Dot, _)) = self.peek() {
+            self.next();
+            let field_name = self.parse_ident()?;
+            let is_call = match self.peek() {
+                Some((Token::LParen, _)) => true,
+                _ => false,
+            };
+            if is_call {
+                self.next();
+                let args = self.parse_call_args()?;
+                self.expect(Token::RParen)?;
+                let mut all_args = vec![CallArg::Positional(expr)];
+                all_args.extend(args);
+                expr = Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::Call {
+                        qualifier: None,
+                        func: field_name,
+                        args: all_args,
+                        is_method: true,
+                    },
+                };
+            } else {
+                expr = Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::FieldAccess {
+                        struct_expr: Box::new(expr),
+                        field_name,
+                    },
+                };
+            }
+        }
+        Ok(expr)
     }
 
     // ===== 结构体初始化字段（支持简写） =====
@@ -658,8 +588,17 @@ impl Parser {
         let mut args = Vec::new();
         while let Some((token, _)) = self.peek() {
             if *token == Token::RParen { break; }
+            // Token::In / Token::Else 混进"像标识符"的判断不是历史遗留、
+            // 也不是笔误——它们都是全局关键字，词法层会把 `in`、`else`
+            // 切成各自的专用 token，而不是 Token::Ident。但标准库规范里
+            // 明确用这两个词当命名参数名：`linear(in: 784, out: 256)`
+            // 用 `in:`，`tensor.cond(..., else: |t| t)` 用 `else:`。这里
+            // 不认它们，这些合法调用就会被错误地拒绝。以后如果规范里
+            // 又冒出别的关键字被用作命名参数名（比如 `for:`），照这个
+            // 格式加一条就行；如果确定某个关键字永远不会出现在这个
+            // 位置，也不用主动加。
             let is_ident_like = match token {
-                Token::Ident | Token::In => true,
+                Token::Ident | Token::In | Token::Else => true,
                 _ => false,
             };
             if is_ident_like && self.peek_nth(1).map(|(t, _)| *t == Token::Colon).unwrap_or(false) {

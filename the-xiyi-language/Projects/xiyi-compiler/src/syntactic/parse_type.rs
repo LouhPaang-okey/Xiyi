@@ -1,7 +1,7 @@
 // src/syntactic/parse_type.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // ===== 类型解析 =====
@@ -28,10 +28,12 @@ impl Parser {
             return Ok(Type::Ref { mutable, inner });
         }
         let base = self.parse_base_type()?;
-        if let Some((Token::Lt, _)) = self.peek() {
-            if let Ok(tag) = self.try_parse_privacy_tag() {
-                return Ok(Type::Privacy(Box::new(base), tag));
-            }
+        // 关键修复：不再由调用方先 peek 一次 '<'、函数内部再 peek 一次——
+        // 现在 parse_privacy_tag 自己开头就是 self.expect(Token::Lt)?，
+        // 不是 '<' 直接 Err，交给 try_parse 判定失败并原样还原 pos，
+        // 不用在这里重复判断一遍。
+        if let Some(tag) = self.try_parse(|p| p.parse_privacy_tag()) {
+            return Ok(Type::Privacy(Box::new(base), tag));
         }
         Ok(base)
     }
@@ -124,59 +126,57 @@ impl Parser {
     }
 
     // ===== 隐私标签 =====
-    pub(crate) fn try_parse_privacy_tag(&mut self) -> Result<PrivacyTag, String> {
-        let pos = self.pos;
-        if let Some((Token::Lt, _)) = self.peek() {
-            self.next();
-            let tag = match self.peek() {
-                Some((Token::Ident, name)) if name == "public" => {
-                    self.next();
-                    PrivacyTag::Public
+    // 改名去掉 try_ 前缀，同时去掉所有手动 self.pos = pos——回滚统一
+    // 交给 module.rs 的 try_parse combinator（调用点见 parse_type 里的
+    // `self.try_parse(|p| p.parse_privacy_tag())`）。这个函数现在只管
+    // "隐私标签长什么样"：失败了直接 Err/`?`，不用再操心"这条分支
+    // 是不是忘了还原 pos"——旧版本 expect(Token::Gt)? 失败时会直接把
+    // Err 网上抛，绕过所有手写还原，是真正的 bug；现在这类失败也会
+    // 被 try_parse 的唯一还原点接住，不会再漏。
+    pub(crate) fn parse_privacy_tag(&mut self) -> Result<PrivacyTag, String> {
+        self.expect(Token::Lt)?;
+        let tag = match self.peek() {
+            Some((Token::Ident, name)) if name == "public" => {
+                self.next();
+                PrivacyTag::Public
+            }
+            Some((Token::Ident, name)) if name == "private" => {
+                self.next();
+                PrivacyTag::Private
+            }
+            Some((Token::Ident, name)) if name == "dp" => {
+                self.next();
+                self.expect(Token::LParen)?;
+                if let Some((Token::Ident, key)) = self.next() {
+                    if key != "eps" {
+                        return Err(format!("Expected 'eps', got '{}'", key));
+                    }
+                } else {
+                    return Err("Expected 'eps'".to_string());
                 }
-                Some((Token::Ident, name)) if name == "private" => {
+                self.expect(Token::Colon)?;
+                let eps = self.parse_rational_literal()?;
+                let delta = if let Some((Token::Comma, _)) = self.peek() {
                     self.next();
-                    PrivacyTag::Private
-                }
-                Some((Token::Ident, name)) if name == "dp" => {
-                    self.next();
-                    self.expect(Token::LParen)?;
                     if let Some((Token::Ident, key)) = self.next() {
-                        if key != "eps" {
-                            return Err(format!("Expected 'eps', got '{}'", key));
+                        if key != "delta" {
+                            return Err(format!("Expected 'delta', got '{}'", key));
                         }
                     } else {
-                        return Err("Expected 'eps'".to_string());
+                        return Err("Expected 'delta'".to_string());
                     }
                     self.expect(Token::Colon)?;
-                    let eps = self.parse_rational_literal()?;
-                    let delta = if let Some((Token::Comma, _)) = self.peek() {
-                        self.next();
-                        if let Some((Token::Ident, key)) = self.next() {
-                            if key != "delta" {
-                                return Err(format!("Expected 'delta', got '{}'", key));
-                            }
-                        } else {
-                            return Err("Expected 'delta'".to_string());
-                        }
-                        self.expect(Token::Colon)?;
-                        Some(self.parse_rational_literal()?)
-                    } else {
-                        None
-                    };
-                    self.expect(Token::RParen)?;
-                    PrivacyTag::Differential { eps, delta }
-                }
-                _ => {
-                    self.pos = pos;
-                    return Err("Expected privacy tag".to_string());
-                }
-            };
-            self.expect(Token::Gt)?;
-            Ok(tag)
-        } else {
-            self.pos = pos;
-            Err("Expected '<' for privacy tag".to_string())
-        }
+                    Some(self.parse_rational_literal()?)
+                } else {
+                    None
+                };
+                self.expect(Token::RParen)?;
+                PrivacyTag::Differential { eps, delta }
+            }
+            _ => return Err("Expected privacy tag".to_string()),
+        };
+        self.expect(Token::Gt)?;
+        Ok(tag)
     }
 
     pub(crate) fn parse_rational_literal(&mut self) -> Result<String, String> {
@@ -210,6 +210,12 @@ impl Parser {
         let mut dims = Vec::new();
         while let Some((token, _)) = self.peek() {
             if *token == Token::RBracket { break; }
+            // 这里的 unwrap 是安全的：上面 `while let Some((token, _))
+            // = self.peek()` 刚确认过当前位置是 Some，中间没有任何
+            // 代码会消费 token，所以 next() 在这里不可能是 None——跟
+            // 下面 Token::Integer 分支里"字符串长得像数字但 parse
+            // 不出来"这种真正有 panic 风险的 unwrap 不是一回事，不用
+            // 跟着改。
             let (token, value) = self.next().unwrap();
             let dim = match token {
                 Token::Ident => {
@@ -225,7 +231,12 @@ impl Parser {
                     }
                 }
                 Token::Integer => {
-                    let num = value.parse::<usize>().unwrap();
+                    // 词法层只保证这是"看起来像整数"的 token，不保证它
+                    // 能塞进 usize（比如超出范围）。解析失败时如实报错，
+                    // 不能 unwrap 让编译器直接 panic。
+                    let num = value.parse::<usize>().map_err(|_| {
+                        format!("Invalid shape dimension literal: {}", value)
+                    })?;
                     ShapeDim::Const(num)
                 }
                 _ => return Err("Expected dimension in shape".to_string()),
