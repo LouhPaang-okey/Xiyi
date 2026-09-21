@@ -149,9 +149,42 @@ impl TypeChecker {
             // 跟任何具体类型相等。真正"T 可以绑定成任意具体类型"这件事，
             // 只发生在调用点/构造点，交给 check_generic.rs 里的
             // unify_type，不要混进这里。
-            (Type::Never, _) | (_, Type::Never) => true,
+            //
+            // 关键修复：这里原来还有一条 `(Type::Never, _) | (_, Type::Never)
+            // => true`——types_equal 是严格的结构相等关系，这条让
+            // Never == I32、Never == 任何东西都成立，副作用是 if 分支/
+            // 函数返回值这些地方一旦某一侧是 panic（类型 Never），比较
+            // 直接“通过”，最终却把 then_ty/body_type 这个 Never 原样
+            // 当成整个表达式的类型返回出去，而不是另一侧真正的类型——
+            // `let x: i32 = if cond { panic("...") } else { 1 };` 会被推
+            // 导成 Never 而不是 i32，x 在后面参与算术时又因为 Never 不是
+            // 数值类型而报一个跟源代码逻辑完全对不上的错误。
+            //
+            // "never 可以兼容任意类型"这条规则本身没错（规范 §6.1
+            // 就是这么写的），只是不该放在这个"两个类型是否结构相等"
+            // 的判断里。真正该用到它的地方（要在两个分支类型里选一个
+            // 当结果类型、或者判断一个实际值是否满足某个期望类型）
+            // 改用下面的 types_equal_allowing_never，那边不仅返回
+            // bool，调用方还知道该在 Never 的情况下选哪一侧的类型
+            // 当结果。这里只保留 Never 和 Never 自己相等。
+            (Type::Never, Type::Never) => true,
             (Type::TypeParam(n1), Type::TypeParam(n2)) => n1 == n2,
             _ => false,
         }
+    }
+
+    // ===== "actual 是否满足 expected" 的宽松版本，专给"这里需要一个
+    // 具体类型的值"的场景用（函数返回、let 绑定、赋值）=====
+    //
+    // never（panic/return/break/continue 的类型）根据规范 §6.1 可以
+    // 强制转换成任意类型 T——因为这些表达式根本不会正常完成，声明成
+    // 什么类型都不影响运行时行为。但这条兼容规则只应该出现在"这里
+    // 需要一个具体类型，而这条路径碰巧走的是一条永远不会真正产生
+    // 值的分支"这种场景，不应该混进 types_equal 本身（结构相等）。
+    pub fn types_equal_allowing_never(&self, actual: &Type, expected: &Type) -> bool {
+        if self.strip_privacy(actual) == Type::Never {
+            return true;
+        }
+        self.types_equal(actual, expected)
     }
 }

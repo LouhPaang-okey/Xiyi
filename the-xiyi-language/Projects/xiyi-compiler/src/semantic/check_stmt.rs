@@ -43,7 +43,7 @@ impl TypeChecker {
                     init_type.clone()
                 };
 
-                if !self.types_equal(&init_type, &resolved_ty) {
+                if !self.types_equal_allowing_never(&init_type, &resolved_ty) {
                     return Err(format!("type mismatch: expected {:?}, got {:?}", resolved_ty, init_type));
                 }
 
@@ -117,12 +117,21 @@ impl TypeChecker {
                         );
                     }
                 }
-                self.check_expr(&for_stmt.iterable)?;
+                // 关键修复：以前这里 self.check_expr(&for_stmt.iterable)?
+                // 的返回值被直接丢弃，只用来触发检查，循环变量类型硬
+                // 编码成 Type::I32。而 check_expr.rs 的 Range 分支自己
+                // 也硬编码返回 Type::I32，两处凑在一起，`0..100i64` 这种
+                // 写法迭代出来的循环变量被判成 I32，循环体里
+                // `let x: i64 = i;` 就会报类型不匹配——Range 那边现在
+                // 已经按两端类型正确返回 I32/I64（元素类型即 Range 表达式
+                // 本身的类型），这里改成直接拿这个结果当循环变量类型，
+                // 不再自己瞎猜一个 I32。
+                let elem_ty = self.check_expr(&for_stmt.iterable)?;
                 self.scopes.push(HashMap::new());
                 self.scopes
                     .last_mut()
                     .unwrap()
-                    .insert(for_stmt.var.clone(), Type::I32);
+                    .insert(for_stmt.var.clone(), elem_ty);
                 let body_type = self.check_block(&for_stmt.body)?;
                 self.scopes.pop();
                 Ok(body_type)
@@ -146,7 +155,7 @@ impl TypeChecker {
                 // { self.cap * 2 };` 这类写法里的字面量分支，得靠这个才能
                 // 正确迁就 target 的真实类型（跟 let 那边是同一套机制）。
                 let expr_ty = self.check_expr_with_expected(&assign_stmt.expr, Some(&target_ty))?;
-                if !self.types_equal(&expr_ty, &target_ty) {
+                if !self.types_equal_allowing_never(&expr_ty, &target_ty) {
                     return Err(format!(
                         "type mismatch in assignment: expected {:?}, got {:?}",
                         target_ty, expr_ty

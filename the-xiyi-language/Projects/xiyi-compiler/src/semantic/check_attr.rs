@@ -37,14 +37,22 @@ impl TypeChecker {
     }
 
     /// 把一个 `AttributeArg::Rational`（有理数字符串，比如 "3/2"、
-    /// "1.5"）转成 f64；不是这个变体就返回 None。真正的字符串解析在
-    /// rational.rs 的 parse_rational 里，这里只是把结果从
-    /// (分子, 分母) 转成 f64，不重新写一遍解析逻辑。
-    pub fn rational_arg_to_f64(arg: &AttributeArg) -> Option<f64> {
+    /// "1.5"）转成 f64。真正的字符串解析在 rational.rs 的
+    /// parse_rational 里，这里只是把结果从 Rational 转成 f64，不重新
+    /// 写一遍解析逻辑。
+    ///
+    /// 关键修复：parse_rational 现在返回 Result 而不是 Option（不再
+    /// 允许吞错，见 rational.rs），这里跟着改成 Result<f64, String>——
+    /// 不是这个变体、或者字符串解析失败，都要把原因如实报出去，不能
+    /// 再像原来那样一律返回 None，让调用方分不清"这根本不是有理数
+    /// 参数"和"是有理数参数但写错了"这两种情况。
+    pub fn rational_arg_to_f64(arg: &AttributeArg) -> Result<f64, String> {
         if let AttributeArg::Rational(r) = arg {
-            Self::parse_rational(r).map(|(num, den)| num as f64 / den as f64)
+            let parsed = Self::parse_rational(r)
+                .map_err(|err| format!("invalid rational literal `{}`: {:?}", r, err))?;
+            Ok(parsed.num as f64 / parsed.den as f64)
         } else {
-            None
+            Err("expected rational argument".to_string())
         }
     }
 }

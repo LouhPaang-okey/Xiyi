@@ -1,6 +1,7 @@
 // src/semantic/check_expr.rs
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::ast::*;
+use crate::intrinsic::{self, CallCtx, CheckedResult, IntrinsicFn};
 use super::check_program::TypeChecker;
 
 impl TypeChecker {
@@ -24,12 +25,15 @@ impl TypeChecker {
         let right_is_literal = is_int_literal(right_expr);
 
         let both_numeric = self.is_numeric_type(&left_inner) && self.is_numeric_type(&right_inner);
-        let types_compatible = self.types_equal(&left_inner, &right_inner)
-            || (both_numeric && (left_is_literal || right_is_literal));
+        // 关键修复：原来这里和下面 result_ty 各自调用了一遍
+        // `self.types_equal(&left_inner, &right_inner)`——同一个问题问
+        // 了两次，抽成一个变量复用。
+        let same_type = self.types_equal(&left_inner, &right_inner);
+        let types_compatible = same_type || (both_numeric && (left_is_literal || right_is_literal));
 
         // 结果类型：两边类型本来就一致就直接用；不一致但被字面量放宽了，
         // 就用"非字面量那侧"的真实类型（字面量给真类型让步）
-        let result_ty = if self.types_equal(&left_inner, &right_inner) {
+        let result_ty = if same_type {
             left_inner.clone()
         } else if left_is_literal {
             right_inner.clone()
@@ -53,7 +57,7 @@ impl TypeChecker {
                     _ => false,
                 };
                 if is_scalar || is_tensor {
-                    let tag = self.join_privacy_labels(left, right);
+                    let tag = self.join_privacy_labels(left, right)?;
                     Ok(self.apply_privacy_tag(result_ty, tag))
                 } else {
                     Err(format!(
@@ -69,7 +73,7 @@ impl TypeChecker {
             | BinaryOp::Le
             | BinaryOp::Ge => {
                 if types_compatible {
-                    let tag = self.join_privacy_labels(left, right);
+                    let tag = self.join_privacy_labels(left, right)?;
                     Ok(self.apply_privacy_tag(Type::Bool, tag))
                 } else {
                     Err(format!(
@@ -80,7 +84,7 @@ impl TypeChecker {
             }
             BinaryOp::And | BinaryOp::Or => {
                 if left_inner == Type::Bool && right_inner == Type::Bool {
-                    let tag = self.join_privacy_labels(left, right);
+                    let tag = self.join_privacy_labels(left, right)?;
                     Ok(self.apply_privacy_tag(Type::Bool, tag))
                 } else {
                     Err("logical operators require bool operands".to_string())
@@ -110,24 +114,28 @@ impl TypeChecker {
         args: &[CallArg],
         expected: Option<&Type>,
     ) -> Result<Type, String> {
-        // 关键新增：`Rational::gcd(a, b)` 这种"限定路径调用"在 parser.rs 里
-        // 跟 `Result::Ok(1)` 长得一模一样（都是 Ident::Ident(args)），parser
-        // 没法只靠语法区分"枚举变体构造"和"调用某个类型 impl 块里的静态
-        // 函数"，索性统一解析成 EnumVariantConstruction，把区分这件事留给
-        // 这里——sema 手里有完整的符号表：先按枚举变体构造尝试，如果
-        // enum_name 根本不是已知枚举，退一步查 self.methods（Item::Implement
-        // 注册进去的函数表），当成限定路径的静态调用检查。两边都查不到
-        // 才真正报错。
-        if !self.enums.contains_key(enum_name) {
+        // 关键修复：原来这里先 `if !self.enums.contains_key(enum_name)`
+        // 判一次、确认存在之后又立刻 `self.enums.get(enum_name)
+        // .ok_or_else(...)`  再判一次——走到第二处时 contains_key 早就
+        // 保证了它一定命中，那句 ok_or_else 里的错误分支是永远到不了
+        // 的死代码。改成一次 `let-else`：查表只查一次，查不到就在
+        // else 分支里做原来 contains_key 分支里那套"退一步查
+        // self.methods，当限定路径静态调用处理"的逻辑。
+        let Some(enum_def) = self.enums.get(enum_name).cloned() else {
+            // 关键新增：`Rational::gcd(a, b)` 这种"限定路径调用"在
+            // parser.rs 里跟 `Result::Ok(1)` 长得一模一样（都是
+            // Ident::Ident(args)），parser 没法只靠语法区分"枚举变体
+            // 构造"和"调用某个类型 impl 块里的静态函数"，索性统一解析
+            // 成 EnumVariantConstruction，把区分这件事留给这里——sema
+            // 手里有完整的符号表：先按枚举变体构造尝试，如果 enum_name
+            // 根本不是已知枚举，退一步查 self.methods（Item::Implement
+            // 注册进去的函数表），当成限定路径的静态调用检查。两边都
+            // 查不到才真正报错。
             if self.methods.get(enum_name).map_or(false, |m| m.contains_key(variant_name)) {
                 return self.check_qualified_static_call(enum_name, variant_name, args, expected);
             }
             return Err(format!("undefined enum: {}", enum_name));
-        }
-
-        let enum_def = self.enums.get(enum_name)
-            .ok_or_else(|| format!("undefined enum: {}", enum_name))?
-            .clone();
+        };
 
         let variant = enum_def.variants.iter()
             .find(|v| v.name == *variant_name)
@@ -137,18 +145,11 @@ impl TypeChecker {
         let mut bindings: HashMap<String, Type> = HashMap::new();
 
         // 关键新增：预置来自外部期望类型的绑定
-        if let Some(Type::Generic(exp_name, exp_args)) = expected {
-            if exp_name == enum_name && exp_args.len() == enum_def.generic_params.len() {
-                let generic_names = Self::generic_param_names(&enum_def.generic_params);
-                for (name, ty) in generic_names.iter().zip(exp_args.iter()) {
-                    bindings.insert(name.clone(), ty.clone());
-                }
-            }
-        }
+        Self::preset_bindings_from_expected(expected, enum_name, &enum_def.generic_params, &mut bindings);
 
         if let Some(expected_ty) = &variant.ty {
             if args.len() != 1 {
-                return Err(format!("variant expects 1 argument"));
+                return Err("variant expects 1 argument".to_string());
             }
             let arg_expr = match &args[0] {
                 CallArg::Positional(e) => e,
@@ -178,7 +179,7 @@ impl TypeChecker {
                 return Err(format!("type mismatch: expected {:?}, got {:?}", expected_ty, arg_ty));
             }
         } else if !args.is_empty() {
-            return Err(format!("variant takes no arguments"));
+            return Err("variant takes no arguments".to_string());
         }
 
         if enum_def.generic_params.is_empty() {
@@ -224,16 +225,24 @@ impl TypeChecker {
         }
         let mut bindings: HashMap<String, Type> = HashMap::new();
 
-        if let Some(Type::Generic(exp_name, exp_args)) = expected {
-            if exp_name == struct_name && exp_args.len() == struct_def.generic_params.len() {
-                let generic_names = Self::generic_param_names(&struct_def.generic_params);
-                for (name, ty) in generic_names.iter().zip(exp_args.iter()) {
-                    bindings.insert(name.clone(), ty.clone());
-                }
-            }
-        }
+        Self::preset_bindings_from_expected(expected, struct_name, &struct_def.generic_params, &mut bindings);
+
+        // 关键修复：以前只检查了"字段个数对不对"，没检查"有没有同一个
+        // 字段名写了两次"——`Point { x: 1, x: 2 }` 对一个只有 x/y 两个
+        // 字段的 struct 来说，个数（2 个）对得上，但两个 x 各自都能在
+        // field_map 里查到，于是"y 缺失、x 被赋值两次"这个真实问题
+        // 完全没被捕捉到，产出一棵语义错误的 AST（y 字段没有初始化
+        // 表达式）却不报错。用一个 HashSet 记录见过的字段名，撞见第二
+        // 次就直接报错。
+        let mut seen_fields: HashSet<&str> = HashSet::new();
 
         for (field_name, field_expr) in fields {
+            if !seen_fields.insert(field_name.as_str()) {
+                return Err(format!(
+                    "duplicate field `{}` in struct {} init",
+                    field_name, struct_name
+                ));
+            }
             let expected_ty = field_map
                 .get(field_name)
                 .ok_or_else(|| format!("unknown field '{}' in struct {}", field_name, struct_name))?
@@ -281,6 +290,55 @@ impl TypeChecker {
                 .collect();
             Ok(Type::Generic(struct_name.to_string(), type_args))
         }
+    }
+
+    // ===== 辅助：if 两个分支都不是 Never 时的"必须相等 + 隐私标签 join" =====
+    // check_expr 和 check_expr_with_expected 的 If Normal 分支，在两侧
+    // 都不是 Never 那个 `_` 兜底里，各自内联了一份一模一样的"类型不
+    // 相等就报错，相等就 join 隐私标签"逻辑，抽成一个方法。
+    fn check_if_branches_match(&self, then_ty: &Type, else_ty: &Type) -> Result<Type, String> {
+        if !self.types_equal_with_privacy(then_ty, else_ty)? {
+            return Err(format!(
+                "if branches have different types: then = {:?}, else = {:?}",
+                then_ty, else_ty
+            ));
+        }
+        let joined_tag = self.join_privacy_labels(then_ty, else_ty)?;
+        let base_ty = self.strip_privacy(then_ty);
+        Ok(self.apply_privacy_tag(base_ty, joined_tag))
+    }
+
+    // ===== 辅助：从外部期望类型里预置泛型绑定 =====
+    // check_struct_init 和 check_enum_variant_construction 各自内联了
+    // 一份一模一样的"期望类型如果是 Type::Generic 且名字/元数对得上，
+    // 就按位置把泛型参数名跟期望类型里的实参预先绑好"逻辑，抽成一个
+    // 共享函数。
+    fn preset_bindings_from_expected(
+        expected: Option<&Type>,
+        name: &str,
+        generic_params: &[GenericParam],
+        bindings: &mut HashMap<String, Type>,
+    ) {
+        if let Some(Type::Generic(exp_name, exp_args)) = expected {
+            if exp_name == name && exp_args.len() == generic_params.len() {
+                let generic_names = Self::generic_param_names(generic_params);
+                for (n, ty) in generic_names.iter().zip(exp_args.iter()) {
+                    bindings.insert(n.clone(), ty.clone());
+                }
+            }
+        }
+    }
+
+    // ===== 辅助：哪些已注册的枚举里有一个恰好叫这个名字的变体 =====
+    // 从 check_expr 和 check_expr_with_expected 两处几乎一模一样的
+    // "在 self.enums 里找变体名匹配"逻辑抽出来——原来两处各自写一遍，
+    // 改一次筛选逻辑（比如以后要排除某种特殊枚举）得同时改两个地方。
+    fn find_enums_with_variant(&self, variant_name: &str) -> Vec<String> {
+        self.enums
+            .iter()
+            .filter(|(_, e)| e.variants.iter().any(|v| v.name == variant_name))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     // ===== check_expr 的"带期望类型提示"版本 =====
@@ -370,15 +428,21 @@ impl TypeChecker {
                                 )
                             }
                         };
-                        if !self.types_equal_with_privacy(&then_ty, &else_ty) {
-                            return Err(format!(
-                                "if branches have different types: then = {:?}, else = {:?}",
-                                then_ty, else_ty
-                            ));
-                        }
-                        let joined_tag = self.join_privacy_labels(&then_ty, &else_ty);
-                        let base_ty = self.strip_privacy(&then_ty);
-                        Ok(self.apply_privacy_tag(base_ty, joined_tag))
+                        // 关键修复：types_equal 不再把 Never 当成"跟一切
+                        // 都相等"，这里显式处理"某一侧是 panic/return/...
+                        // 这类发散表达式"的情况——直接取另一侧的类型当
+                        // 整个 if 的结果类型，不比较两侧是否相等（发散
+                        // 表达式那一侧根本不会真的产生这个 Never 值）。
+                        // 两侧都不是 Never 时，回到原来"必须相等"的检查。
+                        let then_stripped = self.strip_privacy(&then_ty);
+                        let else_stripped = self.strip_privacy(&else_ty);
+                        let result_ty = match (&then_stripped, &else_stripped) {
+                            (Type::Never, Type::Never) => then_ty.clone(),
+                            (Type::Never, _) => else_ty.clone(),
+                            (_, Type::Never) => then_ty.clone(),
+                            _ => self.check_if_branches_match(&then_ty, &else_ty)?,
+                        };
+                        Ok(result_ty)
                     }
                     IfKind::Lack => {
                         if else_expr.is_some() {
@@ -445,12 +509,16 @@ impl TypeChecker {
             // hunt_symbol 里，这里只是委托调用。
             ExprKind::Ident(name) => self.hunt_symbol(name),
             ExprKind::Sym(_) => Ok(Type::I32),
-            ExprKind::Closure { param, body } => {
-                self.scopes.push(HashMap::new());
-                self.scopes.last_mut().unwrap().insert(param.clone(), Type::F32);
-                let body_ty = self.check_expr(body)?;
-                self.scopes.pop();
-                Ok(body_ty)
+            // 关键修复（P1-1）：闭包参数的类型完全由上下文决定
+            // （tensor.cond 里是 input_ty，tensor.while_loop 里是
+            // init_ty），这两条路径现在都走 check_closure，不会走到
+            // 这里。这个分支只有在闭包表达式脱离那些上下文、被单独
+            // check_expr 到时才会触发——原来的兜底是硬编码
+            // Type::F32，等于在假装知道参数类型；一旦真的走到这条路，
+            // 参数会被悄悄当成 F32，产出一个跟源代码逻辑对不上的类型
+            // 错误。改成直接报错，说清楚"闭包不能脱离上下文单独检查"。
+            ExprKind::Closure { .. } => {
+                Err("closure cannot be type-checked without a known parameter type (only valid inside a context such as `tensor.cond` / `tensor.while_loop`)".to_string())
             }
             ExprKind::BinaryOp { op, left, right } => {
                 let left_ty = self.check_expr(left)?;
@@ -513,13 +581,28 @@ impl TypeChecker {
                 // 剥掉引用/隐私标签，一路往里找"元素类型"：
                 // - &T / &mut T -> 直接看里面的 T
                 // - [T]（真正的切片类型，现在有了）-> T
-                // - Vec<T>（或任何单参数泛型，兜底用）-> T
+                // - Vec<T>/Box<T> -> T（真正实现了索引语义的容器）
                 // - Str -> 按字节索引，元素是 U8（对应 bytes[i] 这种写法）
+                //
+                // 关键修复（P1-2）：原来 `Type::Generic(_, args) if
+                // args.len() == 1` 不看类型名字，只要是"单参数泛型"就
+                // 无差别放行——`Option<T>[i]`、单参数写法的
+                // `Result<T>[i]` 这类根本不支持索引的类型也会被放行，
+                // 返回 T，把"这个类型不支持索引"这个本该报出的错误
+                // 悄悄放过去。改成只认确实实现了索引语义的容器类型名。
+                fn is_indexable_container(name: &str) -> bool {
+                    match name {
+                        "Vec" | "Box" => true,
+                        _ => false,
+                    }
+                }
                 fn element_type(ty: &Type) -> Result<Type, String> {
                     match ty {
                         Type::Ref { inner, .. } => element_type(inner),
                         Type::Slice(inner) => Ok((**inner).clone()),
-                        Type::Generic(_, args) if args.len() == 1 => Ok(args[0].clone()),
+                        Type::Generic(name, args) if args.len() == 1 && is_indexable_container(name) => {
+                            Ok(args[0].clone())
+                        }
                         Type::Str => Ok(Type::U8),
                         other => Err(format!("type {:?} does not support indexing", other)),
                     }
@@ -579,12 +662,7 @@ impl TypeChecker {
                 // 名字被多个枚举用作变体名时（真撞了）就报错让用户写限定
                 // 路径消歧义，不去猜。
                 if !is_method {
-                    let matches: Vec<String> = self
-                        .enums
-                        .iter()
-                        .filter(|(_, e)| e.variants.iter().any(|v| v.name == *func))
-                        .map(|(name, _)| name.clone())
-                        .collect();
+                    let matches = self.find_enums_with_variant(func);
                     if matches.len() == 1 {
                         return self.check_enum_variant_construction(&matches[0], func, args, None);
                     } else if matches.len() > 1 {
@@ -597,77 +675,58 @@ impl TypeChecker {
                     }
                 }
 
-                if func == "print" {
-                    if self.in_model {
-                        return Err(
-                            "error[MD001]: side-effect not allowed in model block".to_string()
-                        );
-                    }
-                    for arg in args {
-                        self.check_call_arg(arg)?;
-                    }
-                    return Ok(Type::I32);
-                }
-
-                // `panic(msg)`——之前完全没注册过，sema.rs 查不到就报
-                // "undefined function or method: panic"，codegen.rs 那边现在
-                // 已经在处理 func == "panic" 时生成 Rust 的 panic!(...) 宏了。
-                // 这里补类型检查：唯一参数必须是字符串。
+                // 关键重构：原来这里从 print 一路到 sum，十几个
+                // `if func == "xxx" { ... }` 挨个手写，每个几十行，是
+                // check_expr.rs 体积最大的一段，也是本轮排查里问题最
+                // 密集的一段（relu(42) 静默放行、sum 悄悄丢掉隐私标签、
+                // embedding_dim 为负数时 usize 溢出……）。这些函数的
+                // 参数形状、返回类型推导规则，本质上是"这个内建函数
+                // 长什么样"这件事，跟 TypeChecker 自身的状态（作用域、
+                // 已登记的 struct/enum 等）没关系，属于纯粹的领域知识，
+                // 挪进了 intrinsic.rs（跟这些函数在 mir_builder.rs 那边
+                // 的元数据登记表放在同一个文件），check_expr.rs 只负责
+                // "认出这是不是一个内建函数、算好参数类型、按静态/动态
+                // 两条路径分派"。
                 //
-                // 返回类型比较特殊：panic 在运行时永远不会真的"返回"，这门
-                // 语言的 Type 枚举里没有 Rust 那种 `!`（never）类型，不打算
-                // 为这一个内置函数专门加一个新 Type 变体。这里先返回
-                // Type::Unit，真正让它能出现在"其他分支返回 i32/bool/..."的
-                // match 里的，是下面 ExprKind::Match 那段新加的豁免——分支
-                // 表达式如果就是裸的 panic(...) 调用，不参与"所有分支类型
-                // 必须一致"的比较（效果上等价于 Rust 的 `!` 能兼容任何类型）。
-                if func == "panic" {
-                    if args.len() != 1 {
-                        return Err("`panic` expects exactly 1 argument (a message)".to_string());
+                // 静态内建函数（print/panic/from_utf8_unchecked/
+                // embedding/linear/conv2d/max_pool2d/flatten/reshape/
+                // relu/dropout/layer_norm/sum）：参数类型算完就能直接
+                // 推导结果类型，不需要额外的上下文递归检查。
+                //
+                // 动态内建函数（tensor.cond/tensor.while_loop）：参数
+                // 里带闭包，闭包体的类型检查需要拿接收者的类型
+                // （input_ty/init_ty）当上下文递归调用 check_closure，
+                // 这一步天然离不开 TypeChecker，所以单独走
+                // check_tensor_dynamic_call，不进 intrinsic.rs 的纯函数
+                // check_intrinsic_call。
+                //
+                // 这里把内建函数识别放在"跨 model 调用/递归检查/用户
+                // 函数表查找"之前——内建函数名字（linear/conv2d/...）
+                // 现在当成真正的保留字对待，用户不能定义一个同名函数
+                // 悄悄把内建实现顶替掉（之前 print/panic/from_utf8_unchecked
+                // 三个是这个优先级，但 linear/conv2d 等张量算子却排在
+                // 用户函数表查找之后，同一份代码里两种优先级并存，是
+                // 不必要的不一致）。
+                if let Some(name) = IntrinsicFn::from_str(func) {
+                    if intrinsic::is_dynamic_intrinsic(name) {
+                        return self.check_tensor_dynamic_call(name, args);
                     }
-                    let arg_ty = self.check_call_arg(&args[0])?;
-                    if self.strip_privacy(&arg_ty) != Type::Str {
-                        return Err(format!(
-                            "`panic` expects a string argument, got {:?}",
-                            arg_ty
-                        ));
-                    }
-                    return Ok(Type::Never);    // 这里返回 Type::Never，表示 panic 永远不会返回
+                    return self.check_static_intrinsic_call(name, func, args);
                 }
 
-                // `from_utf8_unchecked(bytes)`——同样是标准库里用了、但从没
-                // 被定义过的内建函数（string.xiyi 的 as_str 方法用它把
-                // &[u8] 强转成 &str），跟 panic 是同一类问题。参数必须是
-                // &[u8]，返回 &str；不检查调用点是不是真的在 unsafe 块内——
-                // 这门编译器目前没有追踪"当前是否处于 unsafe 上下文"的机制，
-                // 属于另一个独立的、更大的安全检查缺口，不在这次范围内。
-                if func == "from_utf8_unchecked" {
-                    if args.len() != 1 {
-                        return Err(
-                            "`from_utf8_unchecked` expects exactly 1 argument".to_string()
-                        );
-                    }
-                    let arg_ty = self.check_call_arg(&args[0])?;
-                    let expected_arg_ty = Type::Ref {
-                        mutable: false,
-                        inner: Box::new(Type::Slice(Box::new(Type::U8))),
-                    };
-                    if !self.types_equal(&self.strip_privacy(&arg_ty), &expected_arg_ty) {
-                        return Err(format!(
-                            "`from_utf8_unchecked` expects &[u8], got {:?}",
-                            arg_ty
-                        ));
-                    }
-                    return Ok(Type::Ref {
-                        mutable: false,
-                        inner: Box::new(Type::Str),
-                    });
-                }
+                // ===== 以下逻辑原样保留，只是位置往后挪了一段（原来夹在
+                // from_utf8_unchecked 和 tensor.cond 之间）=====
 
                 if let Some(ty) = self.try_cross_model_call(func, args)? {
                     return Ok(ty);
                 }
 
+                // 注意：这条守卫是 `self.in_model && ...`——递归本身在
+                // 普通函数（栈域）里没有被禁止，只有 model 块（图域）
+                // 要求计算图能被拓扑排序，才不允许递归。之前重构时
+                // 手滑漏掉过 `self.in_model &&` 这个前提，会导致所有
+                // 普通递归函数（比如阶乘）在 model 块外也被误判成
+                // error[MD002]，这里改回跟原始语义完全一致。
                 if self.in_model && self.fn_stack.contains(func) {
                     return Err(
                         "error[MD002]: recursion not allowed in model block; graph must be topologically sortable"
@@ -688,11 +747,11 @@ impl TypeChecker {
                             ));
                         }
 
-                        // 关键修复：以前这里用 types_equal 死板比较，`id(42)` 这种
-                        // 调用会拿 I32 去跟声明里写的 T（Type::TypeParam("T")）比较，
-                        // 永远不相等。现在改成 unify_type——遇到 T 就记录“T 绑定成了
-                        // 什么”，同一个函数调用里所有参数共享同一张绑定表，保证
-                        // `fn pair<T>(a: T, b: T)` 这种多处用到同一个 T 的场景绑定一致。
+                        // unify_type：遇到 T 就记录"T 绑定成了什么"，同一个
+                        // 函数调用里所有参数共享同一张绑定表，保证
+                        // `fn pair<T>(a: T, b: T)` 这种多处用到同一个 T 的
+                        // 场景绑定一致（不能用 types_equal 死板比较，那样
+                        // `id(42)` 拿 I32 去跟声明里的 T 比较永远不相等）。
                         let mut bindings: HashMap<String, Type> = HashMap::new();
                         for (param, arg) in fn_params.iter().zip(args) {
                             let arg_ty = self.check_call_arg(arg)?;
@@ -704,281 +763,14 @@ impl TypeChecker {
                             }
                         }
 
-                        // 返回类型里出现的 T 也要代入绑定结果，否则 `id(42)` 的返回类型
-                        // 还是裸的 Type::TypeParam("T")，后面 `let _ = id(42);` 之类的赋值
-                        // 检查又会因为类型对不上而报错。
-                        // 关键修复：函数没声明返回类型时，之前兜底成
-                        // I32——一个"没写返回类型"的函数语义上该是 Unit
-                        // （不返回有意义的值），跟 I32 完全是两码事，硬编码
-                        // 成 I32 会在这类函数的调用结果被用在别处时，跟
-                        // 真实语义对不上。
+                        // 返回类型里出现的 T 也要代入绑定结果，否则 `id(42)`
+                        // 的返回类型还是裸的 Type::TypeParam("T")。没声明
+                        // 返回类型时用 Unit，不是 I32。
                         let result_ty = fn_return
                             .map(|ret| self.substitute_type(&ret, &bindings))
                             .unwrap_or(Type::Unit);
                         return Ok(result_ty);
                     }
-                }
-
-                // ===== tensor.cond =====
-                if func == "tensor.cond" {
-                    let input_expr = self.get_call_arg_by_pos_or_name(args, 0, "input")?.0;
-                    let cond_expr = self.get_call_arg_by_pos_or_name(args, 1, "condition")?.0;
-                    let then_expr = self.get_call_arg_by_pos_or_name(args, 2, "then")?.0;
-                    let else_expr = self.get_call_arg_by_pos_or_name(args, 3, "else")?.0;
-
-                    let input_ty = self.check_expr(input_expr)?;
-                    let _ = self.check_closure(cond_expr, &input_ty, Some(&Type::Bool))?;
-                    let then_ty = self.check_closure(then_expr, &input_ty, Some(&input_ty))?;
-                    let else_ty = self.check_closure(else_expr, &input_ty, Some(&input_ty))?;
-                    if !self.types_equal_with_privacy(&then_ty, &else_ty) {
-                        return Err("tensor.cond 'then' and 'else' branches have different types".to_string());
-                    }
-                    return Ok(input_ty);
-                }
-
-                // ===== tensor.while_loop =====
-                if func == "tensor.while_loop" {
-                    let init_expr = self.get_call_arg_by_pos_or_name(args, 0, "init")?.0;
-                    let cond_expr = self.get_call_arg_by_pos_or_name(args, 1, "cond")?.0;
-                    let body_expr = self.get_call_arg_by_pos_or_name(args, 2, "body")?.0;
-
-                    let init_ty = self.check_expr(init_expr)?;
-                    let _ = self.check_closure(cond_expr, &init_ty, Some(&Type::Bool))?;
-                    let _ = self.check_closure(body_expr, &init_ty, Some(&init_ty))?;
-                    return Ok(init_ty);
-                }
-
-                if func == "embedding" {
-                    if args.len() < 2 {
-                        return Err("embedding requires at least two arguments".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    let _num_embeddings = self.extract_int_arg(args, "num_embeddings")?;
-                    let embedding_dim = self.extract_int_arg(args, "embedding_dim")?;
-                    if let Type::Tensor { dtype, ref shape } = self.strip_privacy(&receiver_ty) {
-                        let mut new_shape = shape.clone();
-                        new_shape.push(ShapeDim::Const(embedding_dim as usize));
-                        let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                        let result_ty = Type::Tensor {
-                            dtype: Box::new(Type::F32),
-                            shape: new_shape,
-                        };
-                        return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                    } else {
-                        return Err(format!("embedding expects a tensor, got {:?}", receiver_ty));
-                    }
-                }
-
-                if func == "linear" {
-                    if args.len() < 2 {
-                        return Err("linear requires at least two arguments".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    let in_val = self.extract_int_arg(args, "in")?;
-                    let out_val = self.extract_int_arg(args, "out")?;
-                    if let Type::Tensor { dtype, ref shape } = self.strip_privacy(&receiver_ty) {
-                        if let Some(last) = shape.last() {
-                            if let ShapeDim::Const(c) = last {
-                                if *c != in_val as usize {
-                                    return Err(format!(
-                                        "shape mismatch in linear: input last dim {} does not match 'in' value {}",
-                                        c, in_val
-                                    ));
-                                }
-                            }
-                            let mut new_shape = shape.clone();
-                            if let Some(last) = new_shape.last_mut() {
-                                *last = ShapeDim::Const(out_val as usize);
-                            } else {
-                                return Err("tensor must have at least one dimension".to_string());
-                            }
-                            let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                            let result_ty = Type::Tensor { dtype, shape: new_shape };
-                            return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                        } else {
-                            return Err("tensor must have at least one dimension for linear".to_string());
-                        }
-                    } else {
-                        return Err(format!("linear expects a tensor, got {:?}", receiver_ty));
-                    }
-                }
-
-                if func == "conv2d" {
-                    if args.len() < 2 {
-                        return Err("conv2d requires at least 2 arguments".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    let stripped = self.strip_privacy(&receiver_ty);
-                    if let Type::Tensor { dtype, ref shape } = stripped {
-                        if shape.len() != 3 && shape.len() != 4 {
-                            return Err("conv2d expects 3D [C, H, W] or 4D [B, C, H, W] tensor".to_string());
-                        }
-                        let (c_idx, h_idx, w_idx) = if shape.len() == 4 { (1, 2, 3) } else { (0, 1, 2) };
-
-                        let _in_channels = self.extract_int_arg(args, "in")?;
-                        let out_channels = self.extract_int_arg(args, "out")?;
-                        let kernel = self.extract_int_arg(args, "kernel")?;
-                        let stride = self.extract_int_arg(args, "stride").unwrap_or(1);
-                        let padding = self.extract_int_arg(args, "padding").unwrap_or(0);
-
-                        let h_out = match &shape[h_idx] {
-                            ShapeDim::Const(h) => {
-                                let h = *h as i64;
-                                let h_out = (h + 2 * padding - kernel) / stride + 1;
-                                if h_out <= 0 {
-                                    return Err("conv2d output height non-positive".to_string());
-                                }
-                                ShapeDim::Const(h_out as usize)
-                            }
-                            _ => ShapeDim::Dyn,
-                        };
-                        let w_out = match &shape[w_idx] {
-                            ShapeDim::Const(w) => {
-                                let w = *w as i64;
-                                let w_out = (w + 2 * padding - kernel) / stride + 1;
-                                if w_out <= 0 {
-                                    return Err("conv2d output width non-positive".to_string());
-                                }
-                                ShapeDim::Const(w_out as usize)
-                            }
-                            _ => ShapeDim::Dyn,
-                        };
-
-                        let mut new_shape = shape.clone();
-                        new_shape[c_idx] = ShapeDim::Const(out_channels as usize);
-                        new_shape[h_idx] = h_out;
-                        new_shape[w_idx] = w_out;
-
-                        let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                        let result_ty = Type::Tensor { dtype, shape: new_shape };
-                        return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                    } else {
-                        return Err(format!("conv2d expects a tensor, got {:?}", receiver_ty));
-                    }
-                }
-
-                if func == "max_pool2d" {
-                    if args.len() < 1 {
-                        return Err("max_pool2d requires at least 1 argument".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    let kernel = self.extract_int_arg(args, "kernel")?;
-                    let stride = self.extract_int_arg(args, "stride").unwrap_or(kernel);
-                    if let Type::Tensor { dtype, ref shape } = self.strip_privacy(&receiver_ty) {
-                        if shape.len() != 3 && shape.len() != 4 {
-                            return Err("max_pool2d expects 3D or 4D tensor".to_string());
-                        }
-                        let (h_idx, w_idx) = if shape.len() == 4 { (2, 3) } else { (1, 2) };
-
-                        let h_out = match &shape[h_idx] {
-                            ShapeDim::Const(h) => {
-                                let h = *h as i64;
-                                let h_out = (h - kernel) / stride + 1;
-                                if h_out <= 0 {
-                                    return Err("max_pool2d output height non-positive".to_string());
-                                }
-                                ShapeDim::Const(h_out as usize)
-                            }
-                            _ => ShapeDim::Dyn,
-                        };
-                        let w_out = match &shape[w_idx] {
-                            ShapeDim::Const(w) => {
-                                let w = *w as i64;
-                                let w_out = (w - kernel) / stride + 1;
-                                if w_out <= 0 {
-                                    return Err("max_pool2d output width non-positive".to_string());
-                                }
-                                ShapeDim::Const(w_out as usize)
-                            }
-                            _ => ShapeDim::Dyn,
-                        };
-                        let mut new_shape = shape.clone();
-                        new_shape[h_idx] = h_out;
-                        new_shape[w_idx] = w_out;
-                        let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                        let result_ty = Type::Tensor { dtype, shape: new_shape };
-                        return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                    } else {
-                        return Err(format!("max_pool2d expects a tensor, got {:?}", receiver_ty));
-                    }
-                }
-
-                if func == "flatten" {
-                    if args.len() < 1 {
-                        return Err("flatten requires at least 1 argument".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    if let Type::Tensor { dtype, ref shape } = self.strip_privacy(&receiver_ty) {
-                        let mut total = 1;
-                        let mut all_const = true;
-                        for dim in shape {
-                            if let ShapeDim::Const(c) = dim {
-                                total *= *c;
-                            } else {
-                                all_const = false;
-                                break;
-                            }
-                        }
-                        let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                        let result_ty = if all_const {
-                            let new_shape = vec![ShapeDim::Const(total)];
-                            Type::Tensor { dtype, shape: new_shape }
-                        } else {
-                            Type::Tensor {
-                                dtype: dtype.clone(),
-                                shape: shape.clone(),
-                            }
-                        };
-                        return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                    } else {
-                        return Err(format!("flatten expects a tensor, got {:?}", receiver_ty));
-                    }
-                }
-
-                if func == "reshape" {
-                    if args.len() < 2 {
-                        return Err("reshape requires target shape".to_string());
-                    }
-                    let receiver_ty = self.get_arg_type(&args[0])?;
-                    let shape_vals = match &args[1] {
-                        CallArg::Positional(expr) | CallArg::Named(_, expr) => {
-                            let arg_ty = self.check_expr(expr)?;
-                            if let Type::ConstIntArray(vals) = arg_ty {
-                                vals
-                            } else {
-                                return Err(
-                                    "reshape expects a constant integer array for shape".to_string()
-                                );
-                            }
-                        }
-                    };
-                    let new_shape: Vec<ShapeDim> = shape_vals
-                        .iter()
-                        .map(|&v| ShapeDim::Const(v as usize))
-                        .collect();
-                    let dtype = match self.strip_privacy(&receiver_ty) {
-                        Type::Tensor { dtype, .. } => dtype,
-                        _ => return Err("reshape expects a tensor".to_string()),
-                    };
-                    let privacy_tag = self.extract_privacy_tag(&receiver_ty);
-                    let result_ty = Type::Tensor { dtype, shape: new_shape };
-                    return Ok(self.apply_privacy_tag(result_ty, privacy_tag));
-                }
-
-                if func == "relu" || func == "dropout" || func == "layer_norm" {
-                    if args.len() < 1 {
-                        return Err(format!("{} requires at least 1 argument", func));
-                    }
-                    let arg_ty = self.get_arg_type(&args[0])?;
-                    return Ok(arg_ty);
-                }
-
-                if func == "sum" {
-                    if args.len() < 1 {
-                        return Err("sum requires at least 1 argument".to_string());
-                    }
-                    let _ = self.get_arg_type(&args[0])?;
-                    return Ok(Type::F32);
                 }
 
                 // 方法调用：查方法表（builtin 内建方法表 + self.methods 里
@@ -989,12 +781,14 @@ impl TypeChecker {
                     return self.check_method_call(func, args);
                 }
 
-                if self.in_model && self.model_names.contains(func) {
-                    if let Some(ty) = self.try_cross_model_call(func, args)? {
-                        return Ok(ty);
-                    }
-                }
-
+                // 关键修复：原来这里在报兜底错误之前，又用
+                // `if self.in_model && self.model_names.contains(func) { ... }`
+                // 把 try_cross_model_call 原样再调了一次——但这一步之前
+                // 早就无条件跑过一次一模一样的 try_cross_model_call(func, args)
+                // 了（就是上面那处"以下逻辑原样保留"里的第一行）。执行
+                // 流程能走到这里，说明第一次调用已经返回了 None，中间
+                // self/func/args 都没变过，第二次拿同样的输入调同一个
+                // 函数不可能得到不同的结果——纯粹是多余的重复调用，删掉。
                 for arg in args {
                     self.check_call_arg(arg)?;
                 }
@@ -1081,24 +875,39 @@ impl TypeChecker {
             ExprKind::Range { start, end } => {
                 let start_ty = self.check_expr(start)?;
                 let end_ty = self.check_expr(end)?;
-                if (start_ty == Type::I32 || start_ty == Type::I64)
-                    && (end_ty == Type::I32 || end_ty == Type::I64)
-                {
-                    Ok(Type::I32)
+                let is_i32_or_i64 = |t: &Type| *t == Type::I32 || *t == Type::I64;
+                if is_i32_or_i64(&start_ty) && is_i32_or_i64(&end_ty) {
+                    // 关键修复：以前这里不管两端到底是 I32 还是 I64，一律
+                    // 返回 Type::I32——Range 表达式的类型即"迭代出来的元素
+                    // 类型"（check_stmt.rs 的 for 循环直接拿这个当循环变量
+                    // 类型），`0..100i64` 这种写法迭代出来的变量因此被误判
+                    // 成 I32，循环体里 `let x: i64 = i;` 就会报类型不匹配。
+                    // 两端只要有一侧是 I64，就该按更宽的 I64 处理。
+                    if start_ty == Type::I64 || end_ty == Type::I64 {
+                        Ok(Type::I64)
+                    } else {
+                        Ok(Type::I32)
+                    }
                 } else {
                     Err("range bounds must be integers".to_string())
                 }
             }
             ExprKind::If { kind: if_kind, cond, then_expr, else_expr } => {
+                // 关键修复：原来这里 self.check_expr(cond)? 被调用了两次——
+                // 一次在 `if self.in_model` 分支里单独判断是不是运行时张量
+                // 条件，一次紧接着无条件再算一遍拿去跟 Type::Bool 比较。
+                // 两次算的是同一个表达式，结果不会变，纯粹多做一遍工作
+                // （check_expr 还会把结果写进 self.expr_types，两次写入
+                // 同一个 key 虽然无害，但也没有必要）。改成只算一次，
+                // in_model 的张量条件检查和普通的 bool 检查共用这一份
+                // 结果。
+                let cond_ty = self.check_expr(cond)?;
                 if self.in_model {
-                    let cond_ty = self.check_expr(cond)?;
                     let cond_stripped = self.strip_privacy(&cond_ty);
                     if let Type::Tensor { .. } = cond_stripped {
                         return Err("error[MD003]: runtime tensor condition must use explicit dynamic operator `tensor.cond`".to_string());
                     }
                 }
-
-                let cond_ty = self.check_expr(cond)?;
                 if cond_ty != Type::Bool {
                     return Err("if condition must be bool".to_string());
                 }
@@ -1118,15 +927,22 @@ impl TypeChecker {
                                     .to_string(),
                             );
                         };
-                        if !self.types_equal_with_privacy(&then_ty, &else_ty) {
-                            return Err(format!(
-                                "if branches have different types: then = {:?}, else = {:?}",
-                                then_ty, else_ty
-                            ));
-                        }
-                        let joined_tag = self.join_privacy_labels(&then_ty, &else_ty);
-                        let base_ty = self.strip_privacy(&then_ty);
-                        Ok(self.apply_privacy_tag(base_ty, joined_tag))
+                        // 关键修复：types_equal 不再把 Never 当成"跟一切
+                        // 都相等"（那条规则本身有问题，会让整个 if 的类型
+                        // 被错误推导成 Never，见 check_type.rs 的说明）。
+                        // 这里显式处理"某一侧是 panic/return/... 这类发散
+                        // 表达式"的情况——直接取另一侧的类型当整个 if 的
+                        // 结果类型。两侧都不是 Never 时，回到原来"必须
+                        // 相等"的检查。
+                        let then_stripped = self.strip_privacy(&then_ty);
+                        let else_stripped = self.strip_privacy(&else_ty);
+                        let result_ty = match (&then_stripped, &else_stripped) {
+                            (Type::Never, Type::Never) => then_ty.clone(),
+                            (Type::Never, _) => else_ty.clone(),
+                            (_, Type::Never) => then_ty.clone(),
+                            _ => self.check_if_branches_match(&then_ty, &else_ty)?,
+                        };
+                        Ok(result_ty)
                     }
                     // ===== Lack：反过来，else 必须没有，then 必须是 Unit =====
                     IfKind::Lack => {
@@ -1155,7 +971,7 @@ impl TypeChecker {
                 for elem in elements {
                     let ty = self.check_expr(elem)?;
                     if let Type::I32 | Type::I64 = ty {
-                        if let Some(v) = self.eval_const_int_expr(elem) {
+                        if let Some(v) = intrinsic::eval_const_int_expr(elem) {
                             values.push(v);
                         } else {
                             return Err(format!(
@@ -1207,5 +1023,69 @@ impl TypeChecker {
             self.expr_types.insert(expr.id, ty.clone());
         }
         result
+    }
+
+    // ===== 静态内建函数：算好参数类型后交给 intrinsic.rs 的纯函数 =====
+    fn check_static_intrinsic_call(
+        &mut self,
+        name: IntrinsicFn,
+        func: &str,
+        args: &[CallArg],
+    ) -> Result<Type, String> {
+        let arg_types: Vec<Type> = args
+            .iter()
+            .map(|a| self.check_call_arg(a))
+            .collect::<Result<_, _>>()?;
+
+        // model 块内的副作用限制（error[MD001]）现在统一按 intrinsic.rs
+        // 里每个内建函数自己声明的 allowed_in_model 元数据判断，不用
+        // 再像以前那样为 print 这一个函数单独手写一次 `if self.in_model`
+        // 判断——以后再有新的、model 块内禁止使用的内建函数，只要在
+        // intrinsic.rs 里把 allowed_in_model 设成 false，这里自动就能
+        // 拦下来，不用两边分别记一遍。
+        if self.in_model {
+            if let Some(meta) = intrinsic::get_intrinsic(name) {
+                if !meta.allowed_in_model {
+                    return Err(format!(
+                        "error[MD001]: side-effect not allowed in model block: `{}`",
+                        func
+                    ));
+                }
+            }
+        }
+
+        let ctx = CallCtx { args, arg_types: &arg_types };
+        match intrinsic::check_intrinsic_call(name, &ctx)? {
+            CheckedResult::Plain(ty) => Ok(ty),
+            CheckedResult::Receiver(base_ty) => {
+                let tag = self.extract_privacy_tag(&arg_types[0]);
+                Ok(self.apply_privacy_tag(base_ty, tag))
+            }
+        }
+    }
+
+    // ===== 动态内建函数：闭包参数需要拿接收者类型当上下文递归检查 =====
+    fn check_tensor_dynamic_call(&mut self, name: IntrinsicFn, args: &[CallArg]) -> Result<Type, String> {
+        match name {
+            IntrinsicFn::TensorCond => {
+                let tc = intrinsic::extract_tensor_cond_args(args)?;
+                let input_ty = self.check_expr(tc.input)?;
+                let _ = self.check_closure(tc.condition, &input_ty, Some(&Type::Bool))?;
+                let then_ty = self.check_closure(tc.then_expr, &input_ty, Some(&input_ty))?;
+                let else_ty = self.check_closure(tc.else_expr, &input_ty, Some(&input_ty))?;
+                if !self.types_equal_with_privacy(&then_ty, &else_ty)? {
+                    return Err("tensor.cond 'then' and 'else' branches have different types".to_string());
+                }
+                Ok(input_ty)
+            }
+            IntrinsicFn::TensorWhileLoop => {
+                let tw = intrinsic::extract_tensor_while_loop_args(args)?;
+                let init_ty = self.check_expr(tw.init)?;
+                let _ = self.check_closure(tw.cond, &init_ty, Some(&Type::Bool))?;
+                let _ = self.check_closure(tw.body, &init_ty, Some(&init_ty))?;
+                Ok(init_ty)
+            }
+            _ => unreachable!("check_tensor_dynamic_call 只处理 TensorCond/TensorWhileLoop"),
+        }
     }
 }

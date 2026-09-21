@@ -5,6 +5,43 @@ use crate::ast::*;
 use super::check_program::TypeChecker;
 
 impl TypeChecker {
+    // ===== "进入新上下文、退出时恢复"的通用 combinator =====
+    // check_func 原来手写"保存旧值 -> 设置新值 -> 跑一段可能失败的
+    // 检查 -> 不管成败都先恢复旧值 -> 再决定要不要把错误往上抛"，注释
+    // 里专门解释过为什么不能直接用 `?`（会跳过恢复）。这套模式不止
+    // current_return_type 一处要用——check_closure 里对 self.scopes
+    // 的保存/恢复是同一个模式，抽出来一次写对，别处都不用再手写一遍
+    // 、也不用在每处新增的地方重新验证"恢复有没有漏掉某条失败路径"。
+    fn with_current_return_type<R>(
+        &mut self,
+        new_ty: Option<Type>,
+        f: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let prev = mem::replace(&mut self.current_return_type, new_ty);
+        let result = f(self);
+        self.current_return_type = prev;
+        result
+    }
+
+    // 同上，管的是 self.scopes：整个作用域栈临时替换成只装着给定绑定
+    // 的一个新栈（闭包体检查不应该看见外层函数的局部变量），检查完
+    // 不管成败都恢复原来的作用域栈。
+    fn with_isolated_scope<R>(
+        &mut self,
+        bindings: Vec<(String, Type)>,
+        f: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let old_scopes = mem::take(&mut self.scopes);
+        let mut scope = HashMap::new();
+        for (name, ty) in bindings {
+            scope.insert(name, ty);
+        }
+        self.scopes.push(scope);
+        let result = f(self);
+        self.scopes = old_scopes;
+        result
+    }
+
     // 原名 check_fn_def，按要求改名为 check_func。
     pub fn check_func(&mut self, fn_def: &FnDef) -> Result<(), String> {
         if self.fn_stack.contains(&fn_def.name) {
@@ -22,25 +59,27 @@ impl TypeChecker {
             self.scopes.last_mut().unwrap().insert(param.name.clone(), ty);
         }
 
-        // 保存旧值再设置新值，支持嵌套函数检查时不互相污染。
-        // 注意：不能直接用 ? 提前返回——那样一旦 check_block_with_expected
-        // 报错，下面恢复旧值那行会被跳过，current_return_type 就一直脏
-        // 着，污染后续的检查。用 match 显式处理两种结果，保证恢复动作
-        // 无论成功失败都会执行。
-        let prev_return_type = self.current_return_type.clone();
-        self.current_return_type = fn_def.return_type.clone();
-
-        let body_type_result = self.check_block_with_expected(&fn_def.body, fn_def.return_type.as_ref());
-
-        self.current_return_type = prev_return_type;
-
-        let body_type = body_type_result?;
+        let body_type = self.with_current_return_type(fn_def.return_type.clone(), |s| {
+            s.check_block_with_expected(&fn_def.body, fn_def.return_type.as_ref())
+        })?;
 
         if let Some(expected) = &fn_def.return_type {
-            if !self.types_equal(&body_type, expected) {
+            // 关键修复：never（return/break/continue/panic(...) 的类型）
+            // 按规范 §6.1 可以强制转换成任意类型——函数体最后一句恰好
+            // 是这类发散表达式时（比如 `fn f() -> i32 { panic("boom") }`），
+            // 不该被"函数体类型必须匹配声明的返回类型"这条规则拦下来。
+            // 这条兼容规则不放进 types_equal 本身（那样会让 Never 在
+            // 任何地方都悄悄跟一切类型相等，参见 check_type.rs 的
+            // 说明），只在这种"函数体这里确实需要产出一个具体类型值"
+            // 的位置显式处理。
+            let body_is_never = self.strip_privacy(&body_type) == Type::Never;
+            if !body_is_never && !self.types_equal(&body_type, expected) {
                 return Err(format!("expected return type {:?}, got {:?}", expected, body_type));
             }
-            if !self.types_equal_with_privacy(&body_type, expected) {
+            // 关键修复：types_equal_with_privacy 现在返回 Result（因为
+            // 它内部经过 rational.rs 的有理数比较，不再允许吞错），
+            // 用 `?` 照常传播。
+            if !body_is_never && !self.types_equal_with_privacy(&body_type, expected)? {
                 return Err(format!("privacy label mismatch: expected {:?}, got {:?}", expected, body_type));
             }
         }
@@ -66,17 +105,16 @@ impl TypeChecker {
             _ => return Err("Expected a closure".to_string()),
         };
 
-        let old_scopes = mem::take(&mut self.scopes);
-        self.scopes.push(HashMap::new());
-        self.scopes.last_mut().unwrap().insert(param_name.clone(), param_ty.clone());
+        let ret_ty = self.with_isolated_scope(
+            vec![(param_name.clone(), param_ty.clone())],
+            |s| s.check_expr(body),
+        )?;
 
-        let ret_ty = self.check_expr(body);
-
-        self.scopes = old_scopes;
-
-        let ret_ty = ret_ty?;
         if let Some(expected) = expected_ret {
-            if !self.types_equal_with_privacy(&ret_ty, expected) {
+            // 同 check_func：闭包体是 never（比如 `|t| panic("...")`）时
+            // 不该被返回类型不匹配拦下来。
+            let ret_is_never = self.strip_privacy(&ret_ty) == Type::Never;
+            if !ret_is_never && !self.types_equal_with_privacy(&ret_ty, expected)? {
                 return Err(format!(
                     "Closure return type {:?} does not match expected {:?}",
                     ret_ty, expected

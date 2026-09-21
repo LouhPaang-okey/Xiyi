@@ -9,10 +9,11 @@ const CONST_KEY: &str = "const";
 
 impl TypeChecker {
     // ===== 收集 =====
-    pub fn collect_model_def(&mut self, m: &ModelDef) {
+    pub fn collect_model_def(&mut self, m: &ModelDef) -> Result<(), String> {
         self.register_model_name(m);
         self.register_model_struct(m);
-        self.collect_forward_info(m);
+        self.collect_forward_info(m)?;
+        Ok(())
     }
 
     fn register_model_name(&mut self, m: &ModelDef) {
@@ -33,14 +34,18 @@ impl TypeChecker {
         });
     }
 
-    fn collect_forward_info(&mut self, m: &ModelDef) {
-        let Some(forward) = Self::find_forward(m) else { return };
+    fn collect_forward_info(&mut self, m: &ModelDef) -> Result<(), String> {
+        let Some(forward) = Self::find_forward(m) else { return Ok(()) };
         if let Some(ret) = &forward.return_type {
             self.model_return_types.insert(m.name.clone(), ret.clone());
         }
-        if let Some(sensitivity) = Self::const_sensitivity(forward) {
+        // 关键修复：const_sensitivity 现在返回 Result（rational_arg_to_f64
+        // 不再允许吞掉"这个 sensitivity 值写错了"这种情况），这里用 `?`
+        // 如实传播，不能再假装"解析失败"等价于"没写这个属性"。
+        if let Some(sensitivity) = Self::const_sensitivity(forward)? {
             self.model_sensitivities.insert(m.name.clone(), sensitivity);
         }
+        Ok(())
     }
 
     fn find_forward(m: &ModelDef) -> Option<&FnDef> {
@@ -51,10 +56,21 @@ impl TypeChecker {
     // key=value 参数、有理数转 f64 这三步的通用工具挪到了 check_attr.rs
     // 的 find_attr/find_key_value_arg/rational_arg_to_f64，这里只是
     // 按 model 领域自己的属性名/键名（SENSITIVITY_ATTR/CONST_KEY）串起来调用。
-    fn const_sensitivity(forward: &FnDef) -> Option<f64> {
-        let attr = Self::find_attr(&forward.attributes, SENSITIVITY_ATTR)?;
-        let val = Self::find_key_value_arg(attr, CONST_KEY)?;
-        Self::rational_arg_to_f64(val)
+    //
+    // 关键修复：返回类型从 Option<f64> 改成 Result<Option<f64>, String>——
+    // "没写 #[sensitivity(...)] 属性"（合法，返回 Ok(None)）和"写了但
+    // const 的值不是一个合法有理数"（错误，应该 Err）以前被 rational_arg_to_f64
+    // 的 Option 返回值混成了同一种"None"，用户把 sensitivity 值写错时
+    // 只会看到"这个 model 没有 sensitivity 标注"，而不是"你的 sensitivity
+    // 值写错了"。
+    fn const_sensitivity(forward: &FnDef) -> Result<Option<f64>, String> {
+        let Some(attr) = Self::find_attr(&forward.attributes, SENSITIVITY_ATTR) else {
+            return Ok(None);
+        };
+        let Some(val) = Self::find_key_value_arg(attr, CONST_KEY) else {
+            return Ok(None);
+        };
+        Self::rational_arg_to_f64(val).map(Some)
     }
 
     // ===== 检查 =====
@@ -156,16 +172,16 @@ impl TypeChecker {
         }
 
         let first_arg = &args[0];
-        let receiver_ty = self.get_arg_type(first_arg)?;
+        let receiver_ty = self.check_call_arg(first_arg)?;
 
         // 情况一：直接调用 model
         if let Some(ret_ty) = self.model_return_type(&receiver_ty) {
-            return Ok(Some(self.join_call_result(&receiver_ty, &ret_ty)));
+            return Ok(Some(self.join_call_result(&receiver_ty, &ret_ty)?));
         }
 
         // 情况二：通过 self.field 调用 model
         if let Some(ret_ty) = self.self_field_model_return_type(first_arg) {
-            return Ok(Some(self.join_call_result(&receiver_ty, &ret_ty)));
+            return Ok(Some(self.join_call_result(&receiver_ty, &ret_ty)?));
         }
 
         Ok(None)
@@ -193,9 +209,9 @@ impl TypeChecker {
 
     // 把调用点接收者的隐私标签和 forward 声明返回值的隐私标签 join 起来，
     // 套回 forward 的返回类型上。
-    fn join_call_result(&self, receiver_ty: &Type, ret_ty: &Type) -> Type {
-        let joined = self.join_privacy_labels(receiver_ty, ret_ty);
-        self.apply_privacy_tag(ret_ty.clone(), joined)
+    fn join_call_result(&self, receiver_ty: &Type, ret_ty: &Type) -> Result<Type, String> {
+        let joined = self.join_privacy_labels(receiver_ty, ret_ty)?;
+        Ok(self.apply_privacy_tag(ret_ty.clone(), joined))
     }
 
     // 如果第一个实参写的是 `self.field_name` 这种形式，返回 field_name；

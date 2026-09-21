@@ -14,7 +14,12 @@ impl TypeChecker {
     // 跟声明的返回类型对不上。中间的语句该怎么检查还怎么检查，只有最后
     // 一条、且是不带分号的尾随表达式（Stmt::ExprStmt）时才用这个提示。
     pub fn check_block_with_expected(&mut self, block: &Block, expected: Option<&Type>) -> Result<Type, String> {
-        let mut last_type = Type::I32;
+        // 关键修复：空 block（`{}` / `{ }`）语义上是 Unit——循环体一次
+        // 都不执行，直接落到这里返回。原来默认值是 Type::I32，会让
+        // `fn f() -> Unit { }` 这类写法报"expected Unit, got I32"，
+        // 明明什么都没做，却报出一个跟"什么都没做"这件事完全不相关
+        // 的类型错误。Unit 才是"这个 block 什么值都没产出"的自然默认。
+        let mut last_type = Type::Unit;
         let last_index = block.stmts.len().checked_sub(1);
         for (i, stmt) in block.stmts.iter().enumerate() {
             if Some(i) == last_index {

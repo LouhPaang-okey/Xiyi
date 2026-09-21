@@ -33,23 +33,31 @@ impl TypeChecker {
             _ => None,
         }
     }
-
+    
     // ===== 把一个 implement 块登记进方法表 =====
     // 从 check_program.rs 第一遍遍历的 `Item::Implement(imp) => { ... }`
     // 分支搬过来。
-    pub fn register_impl(&mut self, imp: &ImplementDef) {
-        if let Some(key) = Self::type_key_for_impl_target(&imp.target_type) {
-            let entry = self.methods.entry(key).or_insert_with(HashMap::new);
-            for fn_def in &imp.functions {
-                entry.insert(
-                    fn_def.name.clone(),
-                    MethodInfo {
-                        fn_def: fn_def.clone(),
-                        target_type: imp.target_type.clone(),
-                    },
-                );
+    pub fn register_impl(&mut self, imp: &ImplementDef) -> Result<(), String> {
+        let Some(key) = Self::type_key_for_impl_target(&imp.target_type) else {
+            return Ok(());
+        };
+        let entry = self.methods.entry(key.clone()).or_insert_with(HashMap::new);
+        for fn_def in &imp.functions {
+            if entry.contains_key(&fn_def.name) {
+                return Err(format!(
+                    "error[IMP001]: conflicting implementations of method `{}` for type `{}`",
+                    fn_def.name, key
+                ));
             }
+            entry.insert(
+                fn_def.name.clone(),
+                MethodInfo {
+                    fn_def: fn_def.clone(),
+                    target_type: imp.target_type.clone(),
+                },
+            );
         }
+        Ok(())
     }
 
     // ===== 内建方法表：基础类型（str/整数等）身上"自带"的方法 =====

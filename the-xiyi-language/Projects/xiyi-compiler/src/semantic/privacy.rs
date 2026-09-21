@@ -3,49 +3,65 @@ use crate::ast::*;
 use super::check_program::TypeChecker;
 
 impl TypeChecker {
-    pub fn types_equal_with_privacy(&self, a: &Type, b: &Type) -> bool {
+    // 关键修复：rational.rs 那几个比较函数不再吞错、改成返回
+    // Result<_, RationalError> 之后，这里所有间接依赖它们的函数
+    // （privacy_tags_equal / join_privacy_tags / join_privacy_labels /
+    // types_equal_with_privacy）也必须跟着变成 Result——不然唯一的
+    // 出路又是在这一层用 unwrap_or 把错误吞掉，等于把问题从 rational.rs
+    // 搬到这里，没有真正解决。sema 上层（check_expr.rs/check_func.rs
+    // 等调用方）统一只关心 Result<_, String>，不需要知道 rational.rs
+    // 内部具体的 RationalError 变体，所以在这一层把 RationalError 转成
+    // 带原始字符串（方便定位是哪个字面量出的问题）的 String，往上只
+    // 暴露 String。
+    pub fn types_equal_with_privacy(&self, a: &Type, b: &Type) -> Result<bool, String> {
         match (a, b) {
             (Type::Privacy(inner1, tag1), Type::Privacy(inner2, tag2)) => {
-                self.types_equal(inner1, inner2) && self.privacy_tags_equal(tag1, tag2)
+                Ok(self.types_equal(inner1, inner2) && self.privacy_tags_equal(tag1, tag2)?)
             }
-            (Type::Privacy(inner, _), other) => self.types_equal(inner, other),
-            (other, Type::Privacy(inner, _)) => self.types_equal(other, inner),
-            _ => self.types_equal(a, b),
+            (Type::Privacy(inner, _), other) => Ok(self.types_equal(inner, other)),
+            (other, Type::Privacy(inner, _)) => Ok(self.types_equal(other, inner)),
+            _ => Ok(self.types_equal(a, b)),
         }
     }
 
-    pub fn privacy_tags_equal(&self, a: &PrivacyTag, b: &PrivacyTag) -> bool {
+    pub fn privacy_tags_equal(&self, a: &PrivacyTag, b: &PrivacyTag) -> Result<bool, String> {
         match (a, b) {
-            (PrivacyTag::Public, PrivacyTag::Public) => true,
-            (PrivacyTag::Private, PrivacyTag::Private) => true,
+            (PrivacyTag::Public, PrivacyTag::Public) => Ok(true),
+            (PrivacyTag::Private, PrivacyTag::Private) => Ok(true),
             (PrivacyTag::Differential { eps: e1, delta: d1 }, PrivacyTag::Differential { eps: e2, delta: d2 }) => {
-                Self::rational_eq(e1, e2)
-                    && match (d1, d2) {
-                        (Some(d1), Some(d2)) => Self::rational_eq(d1, d2),
-                        (None, None) => true,
-                        _ => false,
-                    }
+                let eps_eq = Self::rational_eq(e1, e2)
+                    .map_err(|err| format!("invalid differential eps `{}`/`{}`: {:?}", e1, e2, err))?;
+                let delta_eq = match (d1, d2) {
+                    (Some(d1), Some(d2)) => Self::rational_eq(d1, d2)
+                        .map_err(|err| format!("invalid differential delta `{}`/`{}`: {:?}", d1, d2, err))?,
+                    (None, None) => true,
+                    _ => false,
+                };
+                Ok(eps_eq && delta_eq)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
-    pub fn join_privacy_tags(&self, a: &PrivacyTag, b: &PrivacyTag) -> PrivacyTag {
+    pub fn join_privacy_tags(&self, a: &PrivacyTag, b: &PrivacyTag) -> Result<PrivacyTag, String> {
         match (a, b) {
-            (PrivacyTag::Public, x) => x.clone(),
-            (x, PrivacyTag::Public) => x.clone(),
-            (PrivacyTag::Private, _) => PrivacyTag::Private,
-            (_, PrivacyTag::Private) => PrivacyTag::Private,
+            (PrivacyTag::Public, x) => Ok(x.clone()),
+            (x, PrivacyTag::Public) => Ok(x.clone()),
+            (PrivacyTag::Private, _) => Ok(PrivacyTag::Private),
+            (_, PrivacyTag::Private) => Ok(PrivacyTag::Private),
             (PrivacyTag::Differential { eps: e1, delta: d1 }, PrivacyTag::Differential { eps: e2, delta: d2 }) => {
-                let eps = Self::rational_min(e1, e2);
+                let eps = Self::rational_min(e1, e2)
+                    .map_err(|err| format!("invalid differential eps `{}`/`{}`: {:?}", e1, e2, err))?;
                 let delta = match (d1, d2) {
                     (Some(d1), Some(d2)) => {
-                        if Self::rational_le(d1, d2) { Some(d2.clone()) } else { Some(d1.clone()) }
+                        let le = Self::rational_le(d1, d2)
+                            .map_err(|err| format!("invalid differential delta `{}`/`{}`: {:?}", d1, d2, err))?;
+                        Some(if le { d2.clone() } else { d1.clone() })
                     }
                     (Some(d), None) | (None, Some(d)) => Some(d.clone()),
                     (None, None) => None,
                 };
-                PrivacyTag::Differential { eps, delta }
+                Ok(PrivacyTag::Differential { eps, delta })
             }
         }
     }
@@ -65,14 +81,14 @@ impl TypeChecker {
         }
     }
 
-    pub fn join_privacy_labels(&self, a: &Type, b: &Type) -> Option<PrivacyTag> {
+    pub fn join_privacy_labels(&self, a: &Type, b: &Type) -> Result<Option<PrivacyTag>, String> {
         let tag_a = self.extract_privacy_tag(a);
         let tag_b = self.extract_privacy_tag(b);
         match (tag_a, tag_b) {
-            (Some(t1), Some(t2)) => Some(self.join_privacy_tags(&t1, &t2)),
-            (Some(t), None) => Some(t),
-            (None, Some(t)) => Some(t),
-            (None, None) => None,
+            (Some(t1), Some(t2)) => Ok(Some(self.join_privacy_tags(&t1, &t2)?)),
+            (Some(t), None) => Ok(Some(t)),
+            (None, Some(t)) => Ok(Some(t)),
+            (None, None) => Ok(None),
         }
     }
 

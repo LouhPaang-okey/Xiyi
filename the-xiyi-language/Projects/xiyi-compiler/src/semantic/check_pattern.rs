@@ -50,24 +50,30 @@ impl TypeChecker {
 
                     let variant = enum_def.variants.iter()
                         .find(|v| v.name == *variant_name)
-                        .ok_or_else(|| format!("variant not found"))?;
+                        .ok_or_else(|| "variant not found".to_string())?;
 
                     // ===== binding_ty 推断逻辑 =====
+                    // 关键修复：原来这里硬编码"泛型参数名字必须叫 T"，
+                    // `enum Result<T, E> { Ok(T), Err(E) }` 里 Ok(x) 能
+                    // 推到（名字碰巧是 T），但 Err(e) 推不出来——payload
+                    // 类型是 Type::Struct("E")，两个分支都对不上 "T"，
+                    // 落到 `_ => param_ty.clone()`，绑定成裸的 Struct("E")
+                    // 而不是调用点实际传入的类型。改成不按名字猜，用
+                    // enum_def.generic_params 查出真正的参数名列表和
+                    // 下标，payload 类型如果恰好是某个参数名本身，就用
+                    // generic_args 里对应位置的实参替换——这样 Err 是
+                    // 枚举第 1 个（下标 1）泛型参数也能正确处理，不再
+                    // 只能处理第 0 个。
+                    let param_names = Self::generic_param_names(&enum_def.generic_params);
                     let binding_ty = if let Some(param_ty) = &variant.ty {
                         match param_ty {
-                            // 泛型占位符 T（以 Struct 或 Generic 形式出现）
-                            Type::Struct(name) if name == "T" => {
-                                if let Some(real_ty) = generic_args.get(0) {
-                                    real_ty.clone()
+                            Type::Struct(name) | Type::Generic(name, _) => {
+                                if let Some(idx) = param_names.iter().position(|n| n == name) {
+                                    generic_args.get(idx).cloned().ok_or_else(|| {
+                                        format!("missing generic argument for `{}`", name)
+                                    })?
                                 } else {
-                                    return Err("missing generic argument".to_string());
-                                }
-                            }
-                            Type::Generic(name, _) if name == "T" => {
-                                if let Some(real_ty) = generic_args.get(0) {
-                                    real_ty.clone()
-                                } else {
-                                    return Err("missing generic argument".to_string());
+                                    param_ty.clone()
                                 }
                             }
                             _ => param_ty.clone(),
