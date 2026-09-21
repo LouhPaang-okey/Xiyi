@@ -1,5 +1,5 @@
 // intrinsic.rs
-use crate::ast::{Literal, Type};
+use crate::ast::{BinaryOp, CallArg, Expr, ExprKind, Literal, ShapeDim, Type, UnaryOp};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -19,6 +19,12 @@ pub enum IntrinsicFn {
     Dropout,
     LayerNorm,
     Sum,
+    // 关键修复：embedding 原来在 check_expr.rs 里被当作内建函数直接
+    // 手写 `if func == "embedding"` 处理，但从来没有登记进这张表——
+    // 跟这里其它十几个内建函数比，它是唯一一个"有实现、没身份"的。
+    // 补上变体本身还不够，ALL / from_str / build_fn_table 三处必须
+    // 同步加，见下面 ALL 那条注释。
+    Embedding,
 }
 
 impl IntrinsicFn {
@@ -39,7 +45,7 @@ impl IntrinsicFn {
     // None（数组越界访问用的是 `.get`，不会 panic），表现为"这个内建函数
     // 查不到"，而不是编译错误。这是手动维护无法完全消除的代价，只能靠这
     // 条注释和三处改动挨在一起提醒。
-    pub const ALL: [IntrinsicFn; 14] = [
+    pub const ALL: [IntrinsicFn; 15] = [
         Self::Print,
         Self::Panic,
         Self::FromUtf8Unchecked,
@@ -54,6 +60,7 @@ impl IntrinsicFn {
         Self::Dropout,
         Self::LayerNorm,
         Self::Sum,
+        Self::Embedding,
     ];
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -72,6 +79,7 @@ impl IntrinsicFn {
             "dropout" => Some(Self::Dropout),
             "layer_norm" => Some(Self::LayerNorm),
             "sum" => Some(Self::Sum),
+            "embedding" => Some(Self::Embedding),
             _ => None,
         }
     }
@@ -274,6 +282,7 @@ fn build_fn_table() -> [Option<Intrinsic>; FN_COUNT] {
 
     // ---- 张量算子（签名复杂，由 sema 检查） ----
     for (name, link_name, doc) in [
+        (IntrinsicFn::Embedding, "xiyi_math::embedding", "Embedding lookup"),
         (IntrinsicFn::Linear, "xiyi_math::linear", "Linear transformation"),
         (IntrinsicFn::Conv2d, "xiyi_math::conv2d", "2D convolution"),
         (IntrinsicFn::MaxPool2d, "xiyi_math::max_pool2d", "2D max pooling"),
@@ -501,4 +510,533 @@ pub fn resolve_intrinsic_call(
     );
 
     Ok((true, Some(name)))
+}
+
+// ==================== 内建函数类型检查（sema 侧使用） ====================
+//
+// 跟上面 resolve_intrinsic_call 那一段是同一个 IntrinsicFn，但服务的
+// 是完全不同的编译阶段：resolve_intrinsic_call 是 mir_builder.rs 在
+// "降到 MIR"这一步用的（判断这是不是内建调用、要不要拦下副作用/
+// unsafe 违规）；这里是 semantic/check_expr.rs 在"类型检查"这一步用的
+// （每个内建函数的参数长什么样、接收者必须是什么类型、结果类型该
+// 推导成什么）。
+//
+// 纯函数：不依赖 TypeChecker，不调用 sema 方法——check_expr.rs 只把
+// "各参数已经检查出来的类型"传进来，这里只管按每个内建函数自己的
+// 规则做形状/类型推导，不倒回去问 self.xxx。唯一不能纯函数化的是
+// tensor.cond/tensor.while_loop：它们的闭包参数需要 sema 用接收者的
+// 类型（input_ty/init_ty）做上下文去递归检查闭包体，这一步天然离不开
+// TypeChecker（check_closure 是 TypeChecker 的方法），所以这两个走
+// is_dynamic_intrinsic 单独分支，参数布局的提取（哪个位置/哪个具名
+// 参数对应 input/condition/then/else）仍然放在这个文件里，跟其它
+// 内建函数的参数布局知识放在一起。
+
+/// 一次内建函数调用的上下文：参数表达式本身，和调用方已经
+/// check_call_arg 过一遍算出来的类型（顺序一一对应）。
+pub struct CallCtx<'a> {
+    pub args: &'a [CallArg],
+    pub arg_types: &'a [Type],
+}
+
+/// 静态内建函数的检查结果。
+pub enum CheckedResult {
+    /// 直接用这个类型作为结果，不需要调用方再套接收者的隐私标签
+    /// （print → Unit、panic → Never、from_utf8_unchecked → &str，
+    /// 这几个的结果类型跟接收者的隐私标签无关）。
+    Plain(Type),
+    /// 结果类型已经剥掉了隐私标签的"基础形态"，调用方需要从
+    /// `ctx.arg_types[0]`（接收者）提取隐私标签，套回这个类型上再
+    /// 返回——embedding/linear/conv2d/max_pool2d/flatten/reshape/
+    /// relu/dropout/layer_norm/sum 都是"接收者带什么隐私标签，结果
+    /// 就带什么隐私标签"，这条规则统一由调用方处理，这里只管算出
+    /// 不带标签的那部分类型。
+    Receiver(Type),
+}
+
+/// 哪些内建函数是"动态"的——参数里带闭包、需要 sema 用接收者类型做
+/// 上下文递归检查闭包体，走 check_tensor_dynamic_call 那条单独路径，
+/// 不能塞进这个文件的纯函数 check_intrinsic_call 里。
+pub fn is_dynamic_intrinsic(name: IntrinsicFn) -> bool {
+    match name {
+        IntrinsicFn::TensorCond | IntrinsicFn::TensorWhileLoop => true,
+        _ => false,
+    }
+}
+
+/// 静态内建函数的类型检查总入口。调用方（check_expr.rs 的
+/// check_static_intrinsic_call）已经过滤掉了 is_dynamic_intrinsic
+/// 为 true 的两个，这里的 match 对它们只放一个 unreachable 兜底。
+pub fn check_intrinsic_call(name: IntrinsicFn, ctx: &CallCtx) -> Result<CheckedResult, String> {
+    match name {
+        IntrinsicFn::Print => check_print(ctx),
+        IntrinsicFn::Panic => check_panic(ctx),
+        IntrinsicFn::FromUtf8Unchecked => check_from_utf8_unchecked(ctx),
+        IntrinsicFn::TensorCond | IntrinsicFn::TensorWhileLoop => {
+            unreachable!("dynamic intrinsic 走 check_tensor_dynamic_call，不走 check_intrinsic_call")
+        }
+        IntrinsicFn::Embedding => check_embedding(ctx),
+        IntrinsicFn::Linear => check_linear(ctx),
+        IntrinsicFn::Conv2d => check_conv2d(ctx),
+        IntrinsicFn::MaxPool2d => check_max_pool2d(ctx),
+        IntrinsicFn::Flatten => check_flatten(ctx),
+        IntrinsicFn::Reshape => check_reshape(ctx),
+        IntrinsicFn::Relu | IntrinsicFn::Dropout | IntrinsicFn::LayerNorm => check_passthrough(ctx),
+        IntrinsicFn::Sum => check_sum(ctx),
+    }
+}
+
+// ===== 本文件内部的纯函数版本 strip_privacy/is_str_type =====
+// 跟 semantic/privacy.rs 的 TypeChecker::strip_privacy 逻辑完全一样，
+// 但这里不能借 &self 用那个方法——这个文件的设计前提就是不依赖
+// TypeChecker，所以本地另存一份。两边如果以后要改隐私标签的剥离
+// 规则（比如加新的 Type 变体需要一并剥离），要记得两处一起改。
+
+fn strip_privacy_type(ty: &Type) -> Type {
+    match ty {
+        Type::Privacy(inner, _) => strip_privacy_type(inner),
+        Type::Ref { mutable, inner } => Type::Ref {
+            mutable: *mutable,
+            inner: Box::new(strip_privacy_type(inner)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn is_str_type(ty: &Type) -> bool {
+    strip_privacy_type(ty) == Type::Str
+}
+
+fn check_print(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    // print 对参数类型没有限制；调用方（check_static_intrinsic_call）
+    // 已经把所有参数都 check_call_arg 过一遍，这里不需要再检查什么。
+    // model 块内的副作用限制也已经在调用方通过 Intrinsic::
+    // allowed_in_model 统一处理，不用在这里重复判断 in_model。
+    let _ = ctx;
+    Ok(CheckedResult::Plain(Type::Unit))
+}
+
+fn check_panic(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() != 1 {
+        return Err("`panic` expects exactly 1 argument (a message)".to_string());
+    }
+    if !is_str_type(&ctx.arg_types[0]) {
+        return Err(format!(
+            "`panic` expects a string argument, got {:?}",
+            ctx.arg_types[0]
+        ));
+    }
+    Ok(CheckedResult::Plain(Type::Never))
+}
+
+fn check_from_utf8_unchecked(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() != 1 {
+        return Err("`from_utf8_unchecked` expects exactly 1 argument".to_string());
+    }
+    let expected_arg_ty = Type::Ref {
+        mutable: false,
+        inner: Box::new(Type::Slice(Box::new(Type::U8))),
+    };
+    if strip_privacy_type(&ctx.arg_types[0]) != expected_arg_ty {
+        return Err(format!(
+            "`from_utf8_unchecked` expects &[u8], got {:?}",
+            ctx.arg_types[0]
+        ));
+    }
+    Ok(CheckedResult::Plain(Type::Ref {
+        mutable: false,
+        inner: Box::new(Type::Str),
+    }))
+}
+
+fn check_embedding(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() < 2 {
+        return Err("embedding requires at least two arguments".to_string());
+    }
+    // num_embeddings 目前只用于校验"确实传了这个具名参数、而且是
+    // 常量整数"，形状推算用不上它的值。
+    let _num_embeddings = extract_int_arg(ctx.args, "num_embeddings")?;
+    let embedding_dim = extract_int_arg(ctx.args, "embedding_dim")?;
+    // 关键修复（P1-8）：embedding_dim 下面会被 `as usize` 用来扩展
+    // 形状——负数在这一步会静默变成一个巨大的正数（比如 -1 在 64 位
+    // 平台变成 usize::MAX），产出一个荒谬的张量形状，而不是报出
+    // "你传了个负数"这种一眼能看懂的错误。
+    if embedding_dim <= 0 {
+        return Err(format!(
+            "embedding `embedding_dim` must be positive, got {}",
+            embedding_dim
+        ));
+    }
+    match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { shape, .. } => {
+            let mut new_shape = shape.clone();
+            new_shape.push(ShapeDim::Const(embedding_dim as usize));
+            Ok(CheckedResult::Receiver(Type::Tensor {
+                dtype: Box::new(Type::F32),
+                shape: new_shape,
+            }))
+        }
+        _ => Err(format!("embedding expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+fn check_linear(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() < 2 {
+        return Err("linear requires at least two arguments".to_string());
+    }
+    let in_val = extract_int_arg(ctx.args, "in")?;
+    let out_val = extract_int_arg(ctx.args, "out")?;
+    // 关键修复（P1-8）：同 embedding_dim，in_val/out_val 会被
+    // `as usize` 转换用来核对/改写形状维度。
+    if in_val <= 0 {
+        return Err(format!("linear `in` must be positive, got {}", in_val));
+    }
+    if out_val <= 0 {
+        return Err(format!("linear `out` must be positive, got {}", out_val));
+    }
+    match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { dtype, shape } => {
+            if let Some(last) = shape.last() {
+                if let ShapeDim::Const(c) = last {
+                    if *c != in_val as usize {
+                        return Err(format!(
+                            "shape mismatch in linear: input last dim {} does not match 'in' value {}",
+                            c, in_val
+                        ));
+                    }
+                }
+                let mut new_shape = shape.clone();
+                if let Some(last) = new_shape.last_mut() {
+                    *last = ShapeDim::Const(out_val as usize);
+                } else {
+                    return Err("tensor must have at least one dimension".to_string());
+                }
+                Ok(CheckedResult::Receiver(Type::Tensor { dtype, shape: new_shape }))
+            } else {
+                Err("tensor must have at least one dimension for linear".to_string())
+            }
+        }
+        _ => Err(format!("linear expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+fn check_conv2d(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() < 2 {
+        return Err("conv2d requires at least 2 arguments".to_string());
+    }
+    let (dtype, shape) = match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { dtype, shape } => (dtype, shape),
+        _ => return Err(format!("conv2d expects a tensor, got {:?}", ctx.arg_types[0])),
+    };
+    if shape.len() != 3 && shape.len() != 4 {
+        return Err("conv2d expects 3D [C, H, W] or 4D [B, C, H, W] tensor".to_string());
+    }
+    let (c_idx, h_idx, w_idx) = if shape.len() == 4 { (1, 2, 3) } else { (0, 1, 2) };
+
+    let _in_channels = extract_int_arg(ctx.args, "in")?;
+    let out_channels = extract_int_arg(ctx.args, "out")?;
+    let kernel = extract_int_arg(ctx.args, "kernel")?;
+    let stride = extract_int_arg(ctx.args, "stride").unwrap_or(1);
+    let padding = extract_int_arg(ctx.args, "padding").unwrap_or(0);
+
+    // 关键修复（P1-8）：这四个值后面都会参与 `as usize` 转换或除法
+    // 运算，负数/零会静默产出荒谬结果（usize 溢出、除以零 panic）
+    // 而不是报出一条看得懂的错误。
+    if out_channels <= 0 {
+        return Err(format!("conv2d `out` must be positive, got {}", out_channels));
+    }
+    if kernel <= 0 {
+        return Err(format!("conv2d `kernel` must be positive, got {}", kernel));
+    }
+    if stride <= 0 {
+        return Err(format!("conv2d `stride` must be positive, got {}", stride));
+    }
+    if padding < 0 {
+        return Err(format!("conv2d `padding` must be non-negative, got {}", padding));
+    }
+
+    let h_out = match &shape[h_idx] {
+        ShapeDim::Const(h) => {
+            let h = *h as i64;
+            let h_out = (h + 2 * padding - kernel) / stride + 1;
+            if h_out <= 0 {
+                return Err("conv2d output height non-positive".to_string());
+            }
+            ShapeDim::Const(h_out as usize)
+        }
+        _ => ShapeDim::Dyn,
+    };
+    let w_out = match &shape[w_idx] {
+        ShapeDim::Const(w) => {
+            let w = *w as i64;
+            let w_out = (w + 2 * padding - kernel) / stride + 1;
+            if w_out <= 0 {
+                return Err("conv2d output width non-positive".to_string());
+            }
+            ShapeDim::Const(w_out as usize)
+        }
+        _ => ShapeDim::Dyn,
+    };
+
+    let mut new_shape = shape.clone();
+    new_shape[c_idx] = ShapeDim::Const(out_channels as usize);
+    new_shape[h_idx] = h_out;
+    new_shape[w_idx] = w_out;
+
+    Ok(CheckedResult::Receiver(Type::Tensor { dtype, shape: new_shape }))
+}
+
+fn check_max_pool2d(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.is_empty() {
+        return Err("max_pool2d requires at least 1 argument".to_string());
+    }
+    let kernel = extract_int_arg(ctx.args, "kernel")?;
+    if kernel <= 0 {
+        return Err(format!("max_pool2d `kernel` must be positive, got {}", kernel));
+    }
+    let stride = extract_int_arg(ctx.args, "stride").unwrap_or(kernel);
+    if stride <= 0 {
+        return Err(format!("max_pool2d `stride` must be positive, got {}", stride));
+    }
+    match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { dtype, shape } => {
+            if shape.len() != 3 && shape.len() != 4 {
+                return Err("max_pool2d expects 3D or 4D tensor".to_string());
+            }
+            let (h_idx, w_idx) = if shape.len() == 4 { (2, 3) } else { (1, 2) };
+
+            let h_out = match &shape[h_idx] {
+                ShapeDim::Const(h) => {
+                    let h = *h as i64;
+                    let h_out = (h - kernel) / stride + 1;
+                    if h_out <= 0 {
+                        return Err("max_pool2d output height non-positive".to_string());
+                    }
+                    ShapeDim::Const(h_out as usize)
+                }
+                _ => ShapeDim::Dyn,
+            };
+            let w_out = match &shape[w_idx] {
+                ShapeDim::Const(w) => {
+                    let w = *w as i64;
+                    let w_out = (w - kernel) / stride + 1;
+                    if w_out <= 0 {
+                        return Err("max_pool2d output width non-positive".to_string());
+                    }
+                    ShapeDim::Const(w_out as usize)
+                }
+                _ => ShapeDim::Dyn,
+            };
+            let mut new_shape = shape.clone();
+            new_shape[h_idx] = h_out;
+            new_shape[w_idx] = w_out;
+            Ok(CheckedResult::Receiver(Type::Tensor { dtype, shape: new_shape }))
+        }
+        _ => Err(format!("max_pool2d expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+fn check_flatten(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.is_empty() {
+        return Err("flatten requires at least 1 argument".to_string());
+    }
+    match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { dtype, shape } => {
+            let mut total = 1usize;
+            let mut all_const = true;
+            for dim in &shape {
+                if let ShapeDim::Const(c) = dim {
+                    total *= *c;
+                } else {
+                    all_const = false;
+                    break;
+                }
+            }
+            let result_ty = if all_const {
+                Type::Tensor { dtype, shape: vec![ShapeDim::Const(total)] }
+            } else {
+                Type::Tensor { dtype, shape }
+            };
+            Ok(CheckedResult::Receiver(result_ty))
+        }
+        _ => Err(format!("flatten expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+fn check_reshape(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.len() < 2 {
+        return Err("reshape requires target shape".to_string());
+    }
+    let shape_vals = match &ctx.arg_types[1] {
+        Type::ConstIntArray(vals) => vals.clone(),
+        _ => return Err("reshape expects a constant integer array for shape".to_string()),
+    };
+    let mut new_shape = Vec::with_capacity(shape_vals.len());
+    for v in shape_vals {
+        // 关键修复（P1-8）：v 是 i64，直接 `as usize` 在 v 为负数时会
+        // 静默变成一个巨大的正数，产出荒谬的目标形状。
+        if v < 0 {
+            return Err(format!(
+                "reshape target dimension must be non-negative, got {}",
+                v
+            ));
+        }
+        new_shape.push(ShapeDim::Const(v as usize));
+    }
+    let dtype = match strip_privacy_type(&ctx.arg_types[0]) {
+        Type::Tensor { dtype, .. } => dtype,
+        _ => return Err("reshape expects a tensor".to_string()),
+    };
+    Ok(CheckedResult::Receiver(Type::Tensor { dtype, shape: new_shape }))
+}
+
+fn check_passthrough(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.is_empty() {
+        return Err("passthrough intrinsic requires at least 1 argument".to_string());
+    }
+    // 关键修复（P1-5）：以前这三个函数（relu/dropout/layer_norm）
+    // 直接把参数类型原样返回，不检查它到底是不是张量——`relu(42)`
+    // 会被静默放行，返回 I32，这个 I32 混进后面的张量运算链条后，
+    // 报错的位置会跟真实错误原因（一开始就不该传非张量进来）完全
+    // 对不上。
+    let stripped = strip_privacy_type(&ctx.arg_types[0]);
+    match stripped {
+        Type::Tensor { .. } => Ok(CheckedResult::Receiver(stripped)),
+        _ => Err(format!("expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+fn check_sum(ctx: &CallCtx) -> Result<CheckedResult, String> {
+    if ctx.args.is_empty() {
+        return Err("sum requires at least 1 argument".to_string());
+    }
+    match strip_privacy_type(&ctx.arg_types[0]) {
+        // 关键修复（P1-5，顺带发现的另一个问题）：以前这里完全不看
+        // 参数类型，直接返回 Type::F32，而且用的是不套隐私标签的
+        // 路径——一个 dp(1/1) 张量求和之后会静默变成不带隐私标签的
+        // 公开 F32，等于凭空抹掉了隐私保护。这在一门把隐私标签当
+        // 一等公民的语言里是相当危险的疏漏。现在既检查接收者必须是
+        // 张量，又改用 Receiver 而不是 Plain，让调用方按跟其它张量
+        // 算子一样的规则把原来的隐私标签套回结果上。
+        Type::Tensor { .. } => Ok(CheckedResult::Receiver(Type::F32)),
+        _ => Err(format!("sum expects a tensor, got {:?}", ctx.arg_types[0])),
+    }
+}
+
+// ==================== 从 helpers.rs 搬过来的纯函数 ====================
+// 这三个原来是 TypeChecker 的方法（&self），但函数体从来没有用过
+// self 的任何字段——只是因为历史上跟其它需要 &self 的方法写在同一个
+// impl 块里，才带着一个用不上的 &self。它们的调用方现在也大多是这个
+// 文件里的 check_xxx（extract_int_arg），搬过来之后不用再绕一层
+// self.xxx(...)。check_expr.rs 里仅剩的一处调用点（ArrayLiteral 分支）
+// 改成 `crate::intrinsic::eval_const_int_expr(...)`。
+
+pub(crate) fn eval_const_int_expr(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Int8(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::Int16(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::Int32(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::Int64(v)) => Some(*v),
+        ExprKind::Literal(Literal::Int128(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::UInt8(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::UInt16(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::UInt32(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::UInt64(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::UInt128(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::Isize(v)) => Some(*v as i64),
+        ExprKind::Literal(Literal::Usize(v)) => Some(*v as i64),
+        ExprKind::Unary { op: UnaryOp::Neg, expr } => eval_const_int_expr(expr).map(|v| -v),
+        ExprKind::BinaryOp { op, left, right } => {
+            let l = eval_const_int_expr(left)?;
+            let r = eval_const_int_expr(right)?;
+            match op {
+                BinaryOp::Add => Some(l + r),
+                BinaryOp::Sub => Some(l - r),
+                BinaryOp::Mul => Some(l * r),
+                BinaryOp::Div => {
+                    if r == 0 { None } else { Some(l / r) }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_int_arg(args: &[CallArg], name: &str) -> Result<i64, String> {
+    for arg in args {
+        if let CallArg::Named(n, expr) = arg {
+            if n == name {
+                return eval_const_int_expr(expr).ok_or_else(|| {
+                    format!("parameter '{}' is not a constant integer expression", name)
+                });
+            }
+        }
+    }
+    Err(format!("parameter '{}' not found", name))
+}
+
+pub(crate) fn get_arg_by_pos_or_name<'a>(
+    args: &'a [CallArg],
+    pos: usize,
+    name: &str,
+) -> Result<&'a Expr, String> {
+    if let Some(arg) = args.get(pos) {
+        match arg {
+            CallArg::Positional(e) => return Ok(e),
+            CallArg::Named(n, e) => {
+                if n == name {
+                    return Ok(e);
+                }
+            }
+        }
+    }
+    for arg in args {
+        if let CallArg::Named(n, e) = arg {
+            if n == name {
+                return Ok(e);
+            }
+        }
+    }
+    Err(format!(
+        "argument '{}' not found (tried position {} and name '{}')",
+        name, pos + 1, name
+    ))
+}
+
+// ===== 动态内建函数的参数布局 =====
+// tensor.cond / tensor.while_loop 的闭包参数需要 sema 拿接收者类型
+// 做上下文递归检查，参数本身的提取（哪个位置/具名参数对应
+// input/condition/then/else）不需要 TypeChecker，跟其它内建函数的
+// 参数布局知识放在同一个文件里。
+
+pub struct TensorCondArgs<'a> {
+    pub input: &'a Expr,
+    pub condition: &'a Expr,
+    pub then_expr: &'a Expr,
+    pub else_expr: &'a Expr,
+}
+
+pub fn extract_tensor_cond_args<'a>(args: &'a [CallArg]) -> Result<TensorCondArgs<'a>, String> {
+    Ok(TensorCondArgs {
+        input: get_arg_by_pos_or_name(args, 0, "input")?,
+        condition: get_arg_by_pos_or_name(args, 1, "condition")?,
+        then_expr: get_arg_by_pos_or_name(args, 2, "then")?,
+        else_expr: get_arg_by_pos_or_name(args, 3, "else")?,
+    })
+}
+
+pub struct TensorWhileLoopArgs<'a> {
+    pub init: &'a Expr,
+    pub cond: &'a Expr,
+    pub body: &'a Expr,
+}
+
+pub fn extract_tensor_while_loop_args<'a>(
+    args: &'a [CallArg],
+) -> Result<TensorWhileLoopArgs<'a>, String> {
+    Ok(TensorWhileLoopArgs {
+        init: get_arg_by_pos_or_name(args, 0, "init")?,
+        cond: get_arg_by_pos_or_name(args, 1, "cond")?,
+        body: get_arg_by_pos_or_name(args, 2, "body")?,
+    })
 }

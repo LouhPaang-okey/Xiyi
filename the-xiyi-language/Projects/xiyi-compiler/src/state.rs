@@ -120,52 +120,49 @@ impl MirBuilder {
     }
 
     pub(crate) fn pop_scope(&mut self) {
-        if let Some(ids) = self.scope_vars.pop() {
-            for id in ids {
-                let ssa = self.current_ssa(id);
-                // 关键修复（找回上一轮的修复）：不能对作用域里的每个
-                // 变量无条件插 Drop——如果这个变量的当前版本已经在这个
-                // 作用域内被"消费"过（完整读取过一次，或者被当成
-                // Field/Index/EnumPayload 的 base 部分移动过），再补一条
-                // Drop 就是对一个已经移动走的值重复使用，生成的 Rust 会
-                // 是 "use of (partially) moved value"，编译不过。典型
-                // 场景：`match p { Point { x, y } => x }`——x 被直接当成
-                // 匹配结果读出去了，不能再 Drop 一次；`Ok(v) => v`、块尾
-                // 直接返回一个局部变量，都是同一类问题。见
-                // MirBuilder.moved 字段的说明，以及往里登记的地方。
-                if !self.moved.contains(&ssa) {
-                    self.push_stmt(MirStmt::Drop { place: MirPlace::Ssa(ssa) });
-                }
-            }
+        // 关键重构：pop_scope 不再自己维护一份"收集要 Drop 的变量、
+        // 检查 moved、push_stmt"的逻辑——那份逻辑现在只在
+        // emit_drops_for_scopes 里存在一份。pop_scope 要 Drop 的，正是
+        // "当前最内层、也就是即将被弹出的那一层作用域"，这恰好就是
+        // `emit_drops_for_scopes(self.scope_vars.len() - 1)`：
+        // `scope_vars[len-1..]` 是一个只含最后一层的切片，跟原来
+        // `self.scope_vars.pop()` 拿到的是同一批 id。
+        //
+        // 调用顺序很重要：必须先让 emit_drops_for_scopes 读到这层
+        // 作用域（此时它还在 scope_vars 里），再真正把它弹出去——
+        // emit_drops_for_scopes 自己只读不弹，弹栈这一步得由 pop_scope
+        // 来做。
+        if !self.scope_vars.is_empty() {
+            let depth = self.scope_vars.len() - 1;
+            self.emit_drops_for_scopes(depth);
+            self.scope_vars.pop();
         }
         self.scope.pop();
     }
 
-    // -------- 提前退出前的批量 Drop（给 Return / Break 用） --------
-    // 关键重构：Return 和 Break 原来各自手写一遍几乎一模一样的"收集要
-    // Drop 的 SsaLocal，再统一 push_stmt"逻辑（写成两遍分别是为了绕开
-    // 同一个 E0502 借用检查问题——一边不可变遍历 scope_vars，一边要
-    // push_stmt 需要 &mut self），唯一的区别是遍历 scope_vars 的起始
-    // 深度：Return 退出的是整个函数，从 0（最外层）开始；Break 只退出
-    // 这一层循环，从 loop_ctx.scope_depth（循环体自己的作用域）开始。
-    // 抽成一个方法，调用点只需要传一个"从哪层开始"的深度。
+    // -------- 提前退出前的批量 Drop（Drop 语句生成的唯一出口） --------
+    // 关键重构：这个方法原来只给 Return/Break 用，pop_scope 另外单独
+    // 写了一份几乎一样的逻辑——同样是"把一段还开着的作用域里、没被
+    // 消费过的变量补上 Drop"，一个登记进 moved、一个不登记。两份分开
+    // 维护本身就是隐患：眼下 pop_scope 不登记 moved 还没有生成真正的
+    // `drop(x); drop(x);`（pop_scope 处理的永远是"最后一个"会碰到某段
+    // scope_vars 的地方——它把这层作用域整个弹出 scope_vars 之后，
+    // 后面不会再有别的代码路径回头找这批 id 了），但只要以后新增一种
+    // 提前退出的语句、或者调整一下调用顺序，两边只要有一次范围重叠，
+    // 少了这一步登记就会真的生成重复 Drop。让这个方法成为生成 Drop
+    // 语句的唯一出口，pop_scope 退化成对它的一次特例调用（只处理
+    // "最内层那一层作用域"，见下面 pop_scope 的实现），不再自己维护
+    // 一份独立逻辑。
     //
-    // 关键修复（这一轮补上的教训）：原来 Return/Break 各自的版本只
-    // push_stmt 了 Drop 语句，没有把这些变量登记进 self.moved——如果这条
-    // Return/Break 所在的块后面紧跟着一个 pop_scope（比如 Break 所在的
-    // while/loop 循环体自己 push_scope 对应的 pop_scope），pop_scope 会
-    // 对同一批变量再插一次 Drop，生成 `drop(x); drop(x);` 这种重复 Drop。
-    // 在目前的流水线顺序下（pipeline.rs：lower → control::simplify →
-    // borrow_check）这不会真的编译不过——Break 之后那个块从来没人
-    // Goto 进来，是死块，simplify 的 remove_dead_blocks 会在 borrow_check
-    // 看到它之前就把它删掉，最终 MIR 里只剩一份 Drop——但这份正确性是
-    // "死块恰好会被删掉"这个隐式前提撑起来的，不是这段代码自己就对。
-    // 老老实实把已经 Drop 过的变量也登记进 moved，让正确性不用依赖
-    // 别的 pass 的执行顺序。
+    // 顺带带来一个小的正确性改进：原来 pop_scope 是按变量的声明顺序
+    // 正着 Drop 的，这个方法（当初为 Return 设计）按声明顺序倒着
+    // Drop——跟 Rust 真实的析构顺序（后声明的先析构）一致。统一之后
+    // pop_scope 也自然跟着改成这个更正确的顺序。
     pub(crate) fn emit_drops_for_scopes(&mut self, from_depth: usize) {
-        // 跟 pop_scope 同样的借用检查考量（E0502）：先只读地把要 Drop
-        // 的 SsaLocal 收集进独立 Vec（只碰 scope_vars/moved，用的都是
-        // &self），这一轮不可变借用结束后，再单独一轮调用 push_stmt。
+        // 先只读地把要 Drop 的 SsaLocal 收集进独立 Vec（只碰
+        // scope_vars/moved，用的都是 &self），这一轮不可变借用结束后，
+        // 再单独一轮调用 push_stmt——避免一边遍历 scope_vars（&self）
+        // 一边调用需要 &mut self 的 push_stmt 触发 E0502。
         let mut to_drop = Vec::new();
         for scope_ids in self.scope_vars[from_depth..].iter().rev() {
             for &id in scope_ids.iter().rev() {
