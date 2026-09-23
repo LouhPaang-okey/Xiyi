@@ -86,10 +86,17 @@ struct Loan {
 }
 
 // ---- place 的展开形式：根 + 投影链（从根到叶）----
+// 关键修复（Sym/Static 搬家）：mir.rs 把 MirPlace::Static 挪去了
+// MirOperand（见 mir.rs 里 MirPlace 定义处的说明）——MirPlace 现在只有
+// Ssa/Field/Index/Deref/EnumPayload 五种真正的"位置"，全部递归到底都
+// 落在 Ssa 上，不会再有"根是一个静态常量路径"这种情况。Root::Static
+// 这个变体因此变成了永远不会被构造的死变体，删掉；Root 目前只剩
+// Local 一种，暂时保留 enum 的形状（没有收窄成裸 usize），是为了不
+// 牵动 places_overlap 里 `ra != rb` 这处比较逻辑和 flatten 的返回类型
+// ——这是一次独立的、比这次修改范围更大的简化，这次不做。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Root {
     Local(usize),
-    Static(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +269,6 @@ impl BorrowChecker {
                 out.insert(s.base_id);
             }
             MirPlace::Field { base, .. } => Self::collect_place_uses(base, out),
-            MirPlace::Static(_) => {}
             MirPlace::Index { base, index } => {
                 Self::collect_place_uses(base, out);
                 Self::collect_operand_uses(index, out);
@@ -276,6 +282,13 @@ impl BorrowChecker {
         match op {
             MirOperand::Copy(p) | MirOperand::Move(p) => Self::collect_place_uses(p, out),
             MirOperand::Constant(_) => {}
+            // 关键修复（Sym/Static 搬家）：mir.rs 把这两个变体从
+            // MirPlace 挪去了 MirOperand（它们是值，不是"位置"，见
+            // mir.rs 里 MirPlace 定义处的说明）。它们不对应任何局部
+            // 变量，跟原来 MirPlace::Static 分支的处理是同一个道理：
+            // 不产生任何"用到了哪个 base_id"的信息。
+            MirOperand::Sym(_) => {}
+            MirOperand::Static(_) => {}
         }
     }
 
@@ -633,6 +646,19 @@ impl BorrowChecker {
                 None => Ok(()),
             },
             MirTerminator::Switch { discr, .. } => Self::check_operand_use(discr, active, f),
+            // 关键修复（Placeholder/Unreachable 拆分）：mir.rs 新增的
+            // Placeholder 专门表示"这个块的终止器还没被真正设置过"（见
+            // mir.rs 里 MirTerminator 定义处的说明）。借用检查在流水线
+            // 里跑在 control::simplify 之后（pipeline.rs：lower →
+            // control::simplify → borrow_check），任何真正跑完构建的
+            // 函数，到这一步理应不再有 Placeholder 残留——如果真的
+            // 看到一个，说明 mir_builder.rs 某条路径漏了给某个块设置
+            // 终止器，是编译器自身的构建缺陷，不是用户程序的错，不该
+            // 悄悄放过（当成 Unreachable 处理）掩盖这个信号。
+            MirTerminator::Placeholder => Err(
+                "internal error: block terminator is still Placeholder at borrow-check time \
+                 (mir_builder.rs 某条路径构建完没有给这个块设置真正的终止器)".to_string()
+            ),
         }
     }
 
@@ -641,6 +667,12 @@ impl BorrowChecker {
             MirOperand::Copy(p) => Self::check_read(p, active, f),
             MirOperand::Move(p) => Self::check_move(p, active, f),
             MirOperand::Constant(_) => Ok(()),
+            // 关键修复（Sym/Static 搬家）：跟 collect_operand_uses 那处
+            // 同一个道理——Sym/Static 是编译期已知/待 JIT 期绑定的值，
+            // 不指向任何局部变量的内存，谈不上"读"或"移动"，没有借用
+            // 规则可检查。
+            MirOperand::Sym(_) => Ok(()),
+            MirOperand::Static(_) => Ok(()),
         }
     }
 
@@ -784,6 +816,10 @@ impl BorrowChecker {
                 moves.push(p.clone());
             }
             MirOperand::Constant(_) => {}
+            // 关键修复（Sym/Static 搬家）：不指向任何局部变量的内存，
+            // 不产生 copies/moves。
+            MirOperand::Sym(_) => {}
+            MirOperand::Static(_) => {}
         }
     }
 
@@ -797,7 +833,7 @@ impl BorrowChecker {
         moves: &mut Vec<MirPlace>,
     ) {
         match place {
-            MirPlace::Ssa(_) | MirPlace::Static(_) => {}
+            MirPlace::Ssa(_) => {}
             MirPlace::Field { base, .. } => Self::collect_nested_index_operands(base, copies, moves),
             MirPlace::Index { base, index } => {
                 Self::collect_nested_index_operands(base, copies, moves);
@@ -836,7 +872,6 @@ impl BorrowChecker {
     fn flatten(place: &MirPlace) -> (Root, Vec<Proj>) {
         match place {
             MirPlace::Ssa(s) => (Root::Local(s.base_id), Vec::new()),
-            MirPlace::Static(name) => (Root::Static(name.clone()), Vec::new()),
             MirPlace::Field { base, field } => {
                 let (r, mut ps) = Self::flatten(base);
                 ps.push(Proj::Field(field.clone()));
@@ -863,6 +898,11 @@ impl BorrowChecker {
     // ============================================================
     // 辅助
     // ============================================================
+    // 关键说明：Static 分支删掉之后，这个函数其实再也不会返回 None
+    // 了——MirPlace 现在只有 Ssa/Field/Index/Deref/EnumPayload 五种，
+    // 全部递归到底都落在 Ssa 上。保留 Option<usize> 这个签名不变（没有
+    // 收紧成直接返回 usize），是因为改签名要牵动所有调用点，这次不做，
+    // 只求把 E0599（Static 变体不存在）消掉。
     fn place_base_id(place: &MirPlace) -> Option<usize> {
         match place {
             MirPlace::Ssa(s) => Some(s.base_id),
@@ -870,7 +910,6 @@ impl BorrowChecker {
             MirPlace::Index { base, .. } => Self::place_base_id(base),
             MirPlace::Deref(base) => Self::place_base_id(base),
             MirPlace::EnumPayload { base, .. } => Self::place_base_id(base),
-            MirPlace::Static(_) => None,
         }
     }
 
@@ -901,7 +940,6 @@ impl BorrowChecker {
     fn describe_place(place: &MirPlace, f: &MirFn) -> String {
         match place {
             MirPlace::Ssa(s) => Self::get_var_name(f, s.base_id),
-            MirPlace::Static(name) => name.clone(),
             MirPlace::Field { base, field } => format!("{}.{}", Self::describe_place(base, f), field),
             MirPlace::Index { base, .. } => format!("{}[..]", Self::describe_place(base, f)),
             MirPlace::Deref(base) => format!("*{}", Self::describe_place(base, f)),

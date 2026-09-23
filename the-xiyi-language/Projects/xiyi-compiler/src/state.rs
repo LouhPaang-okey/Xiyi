@@ -74,8 +74,14 @@ impl MirBuilder {
     // Drop——对一个已经被（哪怕只是部分）移动过的值调用 drop()，生成
     // 的 Rust 编译不过。这个 helper 就是补上"往上找到底"这一步：Field/
     // Index/Deref/EnumPayload 都是"在某个 place 上面套一层投影"，顺着
-    // base 一路往下找，找到 Ssa 就是这次操作真正touch 到的那个变量；
-    // Static 没有对应的局部变量，返回 None。
+    // base 一路往下找，找到 Ssa 就是这次操作真正touch 到的那个变量。
+    // 关键重构（Sym/Static 搬家）：mir.rs 把 Static（内建关联常量，如
+    // i128::MAX）和 Sym（符号形状引用，如 Sym<B>）都从 MirPlace 挪去了
+    // MirOperand——它们是值，不是"能被赋值/取地址的位置"，见 mir.rs 里
+    // MirPlace 定义处的完整说明。挪走之后 MirPlace 只剩 Ssa/Field/
+    // Index/Deref/EnumPayload 这五种真正的"位置"，这个 match 天然就是
+    // 穷尽的，不再需要给 Static/Sym 各写一条"返回 None"的分支（它们
+    // 现在根本不可能作为 MirPlace 出现，无需在这里处理）。
     pub(crate) fn place_base_ssa(place: &MirPlace) -> Option<SsaLocal> {
         match place {
             MirPlace::Ssa(s) => Some(*s),
@@ -83,7 +89,48 @@ impl MirBuilder {
             MirPlace::Index { base, .. } => Self::place_base_ssa(base),
             MirPlace::Deref(base) => Self::place_base_ssa(base),
             MirPlace::EnumPayload { base, .. } => Self::place_base_ssa(base),
-            MirPlace::Static(_) => None,
+        }
+    }
+
+    // 关键新增：跟 place_base_ssa 配套——那个函数负责"从一个 Place 里
+    // 一路往下找，找到这次操作真正 touch 到的是哪个局部变量"，这个
+    // 函数负责"如果这次求值交出去的是对某个 Ssa 局部变量的 Move，就把
+    // 它登记进 moved"。
+    //
+    // 关键修复：这一步原来只在 build_expr_rvalue 的 HirExprKind::Ident
+    // 分支（读一个裸变量）和 FieldAccess/Index 分支（读字段/下标，标记
+    // 的是 place_base_ssa 找到的根变量）里各自手写了一遍，遗漏了两类
+    // 同样会把"对某个 Ssa 局部变量的 Move"交给调用方的地方：
+    //
+    // 1) build_expr 自己为了求值任何"不是字面量、不是裸标识符"的表达式
+    //    （BinaryOp/Call/StructInit/……）而临时开的那个 __tmp 局部变量，
+    //    以及 if/match 表达式为了汇合各分支值而开的 Phi 目标变量——
+    //    这两种都会被 new_temp 登记进当前作用域的 scope_vars，值构造
+    //    完成后又总是原样以 `MirOperand::Move(Ssa(..))` 的形式交回给
+    //    调用方（调用方接下来会把这个 operand 嵌进它自己的表达式树，
+    //    这个临时变量的值已经被取走了）。如果这里不登记 moved，
+    //    pop_scope 会在这个临时变量的作用域结束时，对一个已经被移动
+    //    走的值重复调用 drop()，生成的 Rust 编译不过——跟 moved 字段
+    //    最初为 Ident/FieldAccess/Index 修的那类问题一模一样，只是这次
+    //    踩中的是"编译器自己造的临时变量"，不是"用户写的变量"，因为
+    //    build_expr 落地临时变量、Phi 落地目标变量这两处从一开始就没
+    //    补这一步登记。
+    //
+    // 2) HirStmt::Assign / HirStmt::Expr 直接调用 build_expr_rvalue（而
+    //    不是 build_expr）拿到的顶层 MirRvalue::Use(operand)——比如
+    //    `x = if c { a } else { b };` 或者把一个 if/match 表达式整个
+    //    当成语句丢弃结果——这两处拿到的 operand 完全绕开了 build_expr
+    //    尾部那次统一处理，同样可能是对 Phi 目标变量的 Move，同样需要
+    //    登记，否则该变量作用域结束时会被重复 Drop。
+    //
+    // 不把这条登记规则各自散落地在每个调用点重写一遍，收进这一个
+    // helper：调用方只要在"即将把一个 operand 真正交出去、这个 operand
+    // 会被嵌进别处的表达式树"这个时刻调用一次即可。对已经登记过的
+    // ssa 再调用一次是幂等的（HashSet::insert），不会因为 Ident/
+    // FieldAccess/Index 那几处已经手动登记过而重复出问题。
+    pub(crate) fn mark_moved_operand(&mut self, operand: &MirOperand) {
+        if let MirOperand::Move(MirPlace::Ssa(ssa)) = operand {
+            self.moved.insert(*ssa);
         }
     }
 
@@ -120,6 +167,28 @@ impl MirBuilder {
     }
 
     pub(crate) fn pop_scope(&mut self) {
+        // 关键新增：scope（变量名 -> id 的查找表）和 scope_vars（这层
+        // 作用域登记了哪些 id，供 Drop 用）本该永远同步 push/pop——
+        // push_scope 一次性把两者都 push 一层，理论上不该有任何路径
+        // 只碰一个不碰另一个。但这只是"理论上"：这两个 Vec 各自独立，
+        // 编译器不会替我们检查这件事，一旦以后哪条新路径（或者一次
+        // 疏忽的重构）在某个分支里漏调了 push_scope、或者提前调了一次
+        // pop_scope，这里的 `self.scope.pop()` 会静默地多弹一层或者
+        // 少弹一层——多弹会把外层作用域的变量表整个丢掉（后面的
+        // lookup 全部失败或者查到错误的外层同名变量），少弹会让一层
+        // 该消失的作用域一直挂在 self.scope 里（后面同名变量的
+        // lookup 可能被这层"本该已经不存在"的绑定错误地挡住）。两种
+        // 后果都不是"编译器直接报错"，而是构建期状态悄悄错位、多半要
+        // 等生成的 Rust 跑出诡异结果或者编译失败时才会被发现，届时
+        // 已经很难跟"某处忘了配对 push/pop"这个真正原因联系起来。
+        // 这里加一行 debug_assert 把这条不变式钉死：只要两个栈的深度
+        // 曾经有一刻不一致，立刻在 debug 构建里 panic 报出来，不用等
+        // 到下游某个更迷惑的错误现象才回头怀疑到这里。
+        debug_assert_eq!(
+            self.scope.len(),
+            self.scope_vars.len(),
+            "MirBuilder.scope 和 scope_vars 深度不同步——某处 push_scope/pop_scope 没有配对调用"
+        );
         // 关键重构：pop_scope 不再自己维护一份"收集要 Drop 的变量、
         // 检查 moved、push_stmt"的逻辑——那份逻辑现在只在
         // emit_drops_for_scopes 里存在一份。pop_scope 要 Drop 的，正是
@@ -213,17 +282,26 @@ impl MirBuilder {
     }
 
     // -------- 基本块 --------
-    // 关键设计：块在用到之前就先创建好（占位终止器是 Unreachable），
-    // 之后随时可以用 id 引用它、往里面塞语句，最后再补上真正的终止器。
-    // 这是为了支持 if/while 这类需要"提前知道 then/else 块的 id 才能
-    // 设置当前块的跳转目标"的控制流——不这样做的话，构建顺序会陷入
-    // "先有鸡还是先有蛋"的死结。
+    // 关键设计：块在用到之前就先创建好（占位终止器），之后随时可以用
+    // id 引用它、往里面塞语句，最后再补上真正的终止器。这是为了支持
+    // if/while 这类需要"提前知道 then/else 块的 id 才能设置当前块的
+    // 跳转目标"的控制流——不这样做的话，构建顺序会陷入"先有鸡还是先
+    // 有蛋"的死结。
+    //
+    // 关键重构（Placeholder/Unreachable 拆分，见 mir.rs::MirTerminator
+    // 定义处的说明）：这里原来拿 Unreachable 当占位终止器用，语义上
+    // 是两件不同的事——Unreachable 该表示"已知执行不到这里"（发散
+    // 之后、match 穷尽之后……），Placeholder 才是"这个块还没被真正
+    // 写过终止器"。改成 Placeholder，`current_block_terminator_is_unset`
+    // （下面，原名 current_terminator_is_placeholder）也跟着改成查
+    // Placeholder，不再用"terminator 恰好等于 Unreachable"这个巧合
+    // 兜底判断"是不是还没写"。
     pub(crate) fn new_block(&mut self) -> usize {
         let id = self.blocks.len();
         self.blocks.push(MirBlock {
             id,
             stmts: Vec::new(),
-            terminator: MirTerminator::Unreachable,
+            terminator: MirTerminator::Placeholder,
         });
         id
     }
@@ -240,9 +318,14 @@ impl MirBuilder {
         self.blocks[self.current_block].terminator = term;
     }
 
-    pub(crate) fn current_terminator_is_placeholder(&self) -> bool {
+    // 关键重构：改名自 current_terminator_is_placeholder——"is_placeholder"
+    // 这个名字在 Placeholder 变体存在之后会引起歧义（听起来像是在问
+    // "terminator 是不是 Placeholder 这个具体变体"，实际问的正好就是
+    // 这件事，但改名成 is_unset 更直白：不用记住"占位"具体对应哪个
+    // 变体，望文生义就知道这是在问"这个块的终止器是不是还没被设置过"。
+    pub(crate) fn current_block_terminator_is_unset(&self) -> bool {
         match self.blocks[self.current_block].terminator {
-            MirTerminator::Unreachable => true,
+            MirTerminator::Placeholder => true,
             _ => false,
         }
     }

@@ -768,6 +768,11 @@ impl Monomorphic {
                 Self::update_enum_names_in_place(place, locals);
             }
             MirOperand::Constant(_) => {}
+            // 关键修复（Sym/Static 搬家）：这两个变体从 MirPlace 挪来
+            // MirOperand 之后，不包含任何 MirPlace，没有 enum_name 需要
+            // 更新，跟 Constant 是同一个道理。
+            MirOperand::Sym(_) => {}
+            MirOperand::Static(_) => {}
         }
     }
 
@@ -795,7 +800,15 @@ impl Monomorphic {
                     }
                 }
             }
-            _ => {}
+            // 关键修复（穷尽列出，去掉 `_` 兜底）：上面 Ssa/Field/Index/
+            // Deref/EnumPayload 五条分支已经覆盖了 MirPlace 现在的全部
+            // 变体（Sym/Static 已经搬去 MirOperand，不会出现在这里），
+            // 原来收尾的 `_ => {}` 因此从来不会被真的走到，纯粹是给
+            // 已经删除的 Local 变体留的痕迹。删掉它让这个 match 变成
+            // 真正的穷尽匹配——以后 mir.rs 给 MirPlace 加新变体时，这里
+            // 会因为"non-exhaustive match"编译不过，逼着回来决定这个
+            // 新变体要不要携带 enum_name、需不需要递归，而不是被通配符
+            // 悄悄吞掉、留下一个"看起来处理了、其实什么都没做"的假象。
         }
     }
 
@@ -810,7 +823,11 @@ impl Monomorphic {
             MirPlace::Index { base, .. } => Self::extract_local_id_from_place(base),
             MirPlace::Deref(base) => Self::extract_local_id_from_place(base),
             MirPlace::EnumPayload { base, .. } => Self::extract_local_id_from_place(base),
-            _ => None,
+            // 关键修复（穷尽列出，去掉 `_` 兜底）：同
+            // update_enum_names_in_place 那处——五条分支已经穷尽了
+            // MirPlace 现在的全部变体，原来的 `_ => None` 从来不会被
+            // 真的走到，删掉它，让新增变体时的遗漏在这里编译不过，而
+            // 不是被悄悄归到 None 里。
         }
     }
 

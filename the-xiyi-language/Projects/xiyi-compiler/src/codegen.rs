@@ -367,6 +367,17 @@ impl Codegen {
             MirTerminator::Goto(_) | MirTerminator::If { .. } | MirTerminator::Switch { .. } => {
                 "    unreachable!(\"single-block function has a Goto/If/Switch terminator — mir_builder bug\");\n".to_string()
             }
+            // 关键修复（Placeholder/Unreachable 拆分）：mir.rs 新增的
+            // Placeholder 专门表示"这个块的终止器还没被真正设置过"（见
+            // mir.rs 里 MirTerminator 定义处的说明）。走到 codegen 这一步
+            // 还留着 Placeholder，说明 mir_builder.rs 某条构建路径漏了
+            // 给某个块设置终止器，是编译器自身的缺陷——跟上面
+            // Goto/If/Switch 那支同样的处理方式：生成一段带着诊断信息
+            // 的 `unreachable!()`，而不是悄悄当成真正的 Unreachable
+            // （那样会把"没写完"和"真的到不了"混为一谈，掩盖构建缺陷）。
+            MirTerminator::Placeholder => {
+                "    unreachable!(\"block terminator is still Placeholder — mir_builder bug\");\n".to_string()
+            }
         }
     }
 
@@ -417,6 +428,12 @@ impl Codegen {
                 code.push_str("    }\n    continue;\n");
                 code
             }
+            // 关键修复（Placeholder/Unreachable 拆分）：同单块函数版本
+            // 那支——Placeholder 走到 codegen 说明 mir_builder.rs 有
+            // 构建缺陷，生成带诊断信息的 unreachable!()。
+            MirTerminator::Placeholder => {
+                "    unreachable!(\"block terminator is still Placeholder — mir_builder bug\");\n".to_string()
+            }
         }
     }
 
@@ -424,15 +441,21 @@ impl Codegen {
     // ===== Place → Rust 字符串 =====
     fn place_to_string(place: &MirPlace, ctx: &CodegenContext) -> String {
         match place {
-            // 关键修复：`MirPlace::Local` 这个变体在 mir.rs 这一轮已经
-            // 被彻底删掉了（"SSA 完整版，Local 被废弃"）——这份 mir.rs
-            // 的 MirPlace 定义现在只有 Ssa/Field/Static/Index/Deref/
-            // EnumPayload 六种，原来这里还留着一支
-            // `MirPlace::Local(id) => ...`，对着一个已经不存在的枚举
-            // 变体做匹配，编译不过（E0599）。所有原来经 Local 寻址的
-            // 东西（cond_temp/disc_temp/dest_base 这些内部临时变量）
-            // 现在统一经 Ssa 寻址，下面 MirPlace::Ssa 那支已经在处理
-            // 了，不需要另开一支。
+            // 关键修复：`MirPlace::Local` 这个变体在 mir.rs 更早一轮已经
+            // 被彻底删掉了（"SSA 完整版，Local 被废弃"）——mir.rs 的
+            // MirPlace 定义现在只有 Ssa/Field/Index/Deref/EnumPayload
+            // 五种，原来这里还留着一支 `MirPlace::Local(id) => ...`，
+            // 对着一个已经不存在的枚举变体做匹配，编译不过（E0599）。
+            // 所有原来经 Local 寻址的东西（cond_temp/disc_temp/
+            // dest_base 这些内部临时变量）现在统一经 Ssa 寻址，下面
+            // MirPlace::Ssa 那支已经在处理了，不需要另开一支。
+            //
+            // 关键修复（Sym/Static 搬家）：mir.rs 又把 Static（内建
+            // 关联常量）和 Sym（符号形状引用）都从 MirPlace 挪去了
+            // MirOperand——它们是值，不是"位置"（见 mir.rs 里 MirPlace
+            // 定义处的说明）。原来这里的 `MirPlace::Static(name) =>
+            // name.clone()` 分支删掉，等价的逻辑挪到下面
+            // operand_to_string 的 MirOperand::Static 分支。
             MirPlace::Field { base, field } => {
                 format!("{}.{}", Self::place_to_string(base, ctx), field)
             }
@@ -447,7 +470,6 @@ impl Codegen {
             MirPlace::Ssa(ssa) => ctx.locals.get(&ssa.base_id)
                 .cloned()
                 .unwrap_or_else(|| format!("__local_{}", ssa.base_id)),
-            MirPlace::Static(name) => name.clone(),
             MirPlace::Index { base, index } => {
                 format!("{}[{}]", Self::place_to_string(base, ctx), Self::operand_to_string(index, ctx))
             }
@@ -483,6 +505,20 @@ impl Codegen {
             MirOperand::Copy(place) => Self::place_to_string(place, ctx),
             MirOperand::Move(place) => Self::place_to_string(place, ctx),
             MirOperand::Constant(lit) => Self::literal_to_string(lit),
+            // 关键新增（Sym/Static 搬家）：这两个变体从 MirPlace 挪过来
+            // 之后，落地成 Rust 代码的逻辑原样照搬过来——Static 的
+            // 字符串本来就是一段合法的、可以裸写的 Rust 关联常量路径
+            // （如 `i128::MAX`），直接输出；Sym 目前在 sema/mir_builder
+            // 里都还没有真正的符号求解语义，落到 codegen 这一层还没有
+            // "该生成什么 Rust 代码"的答案，先给一个明确的
+            // `unimplemented!` 而不是悄悄把符号名当成变量名裸写出去
+            // （生成一个引用不存在标识符的 Rust 表达式，编译不过还不
+            // 好定位）。
+            MirOperand::Sym(name) => format!(
+                "unimplemented!(\"Sym<{}> 尚未实现代码生成：符号形状还没有真正的求解/绑定语义\")",
+                name
+            ),
+            MirOperand::Static(name) => name.clone(),
         }
     }
 
@@ -606,8 +642,10 @@ impl Codegen {
                         // IntrinsicFn 之后甚至连编译都过不了：IntrinsicFn
                         // 压根没有 I128Max 这个变体）。i128::MAX 这类关联
                         // 常量真正的落地路径是 mir_builder.rs 里提前识别
-                        // 出来、直接产出 MirPlace::Static，根本不会走到
-                        // MirRvalue::Call 这里（见 mir_builder.rs 里那段
+                        // 出来、直接产出 MirOperand::Static（这个值现在
+                        // 挂在 MirOperand 上，不是 MirPlace——见 mir.rs
+                        // 里 MirPlace 定义处关于 Sym/Static 搬家的说明），
+                        // 根本不会走到 MirRvalue::Call 这里（见 mir_builder.rs 里那段
                         // "内建关联常量" 的注释），所以这里不需要、也不能
                         // 保留一个处理常量的分支，直接删掉，让常量相关的
                         // 调用全部落进下面的通用 intrinsic 分支处理。

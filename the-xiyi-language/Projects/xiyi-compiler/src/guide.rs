@@ -10,7 +10,7 @@
 use crate::ast::Type;
 use crate::hir::*;
 use crate::mir::*;
-use crate::mir_builder::{Diverging, MirBuilder, SharedContext};
+use crate::mir_builder::{propagated, Diverging, MirBuilder, SharedContext};
 
 impl MirBuilder {
     // -------- Place（左值） --------
@@ -18,9 +18,11 @@ impl MirBuilder {
     // build_block 同一套 Diverging<T> 传播——下标表达式本身可能发散
     // （`arr[panic()] = 5;`），这里跟别处一样，见到 Diverged 就不再
     // 往下求值，原样传播给调用方（目前唯一的调用方是 mir_builder.rs
-    // 的 HirStmt::Assign）。这个文件跟 mir_builder.rs 是平级模块，
-    // `propagate!` 宏没有额外导出为 pub(crate)，这里就不 `use` 它，
-    // 直接手写 match，跟宏展开出来的代码完全等价。
+    // 的 HirStmt::Assign）。项目里不用宏，`propagated` 是
+    // mir_builder.rs 里的一个普通 pub(crate) 函数（负责把
+    // `Diverging<T>` 分类成 `Ok(v)`/`Err(())`），不是宏，这里直接
+    // `use` 过来跟那边用同一套写法：`match propagated(...) { Ok(v) =>
+    // v, Err(()) => return Ok(Diverging::Diverged) }`。
     pub(crate) fn build_place(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<Diverging<MirPlace>, String> {
         match &expr.kind {
             HirExprKind::Ident(name) => {
@@ -28,20 +30,20 @@ impl MirBuilder {
                 Ok(Diverging::Value(MirPlace::Ssa(self.current_ssa(id))))
             }
             HirExprKind::FieldAccess { struct_expr, field_name } => {
-                let base = match self.build_place(struct_expr, shared)? {
-                    Diverging::Diverged => return Ok(Diverging::Diverged),
-                    Diverging::Value(p) => p,
+                let base = match propagated(self.build_place(struct_expr, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
                 };
                 Ok(Diverging::Value(MirPlace::Field { base: Box::new(base), field: field_name.clone() }))
             }
             HirExprKind::Index { expr: base, index } => {
-                let base_place = match self.build_place(base, shared)? {
-                    Diverging::Diverged => return Ok(Diverging::Diverged),
-                    Diverging::Value(p) => p,
+                let base_place = match propagated(self.build_place(base, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
                 };
-                let index_operand = match self.build_expr(index, shared)? {
-                    Diverging::Diverged => return Ok(Diverging::Diverged),
-                    Diverging::Value(op) => op,
+                let index_operand = match propagated(self.build_expr(index, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
                 };
                 Ok(Diverging::Value(MirPlace::Index { base: Box::new(base_place), index: Box::new(index_operand) }))
             }

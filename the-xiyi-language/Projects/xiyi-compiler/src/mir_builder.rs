@@ -19,6 +19,7 @@ use crate::ast::{Pattern, Type};
 use crate::hir::*;
 use crate::mir::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use crate::intrinsic::IntrinsicFn;
 
 // ===== 跨函数共享的只读上下文（build() 里构建一次，每个函数复用） =====
@@ -60,6 +61,17 @@ pub(crate) struct SharedContext {
 pub(crate) struct LoopCtx {
     pub(crate) break_target: usize,
     pub(crate) scope_depth: usize,
+}
+
+// 关键新增（循环头 Phi）：insert_loop_header_phis 插入的每一条 Phi，
+// 需要在循环体构建完之后回去补第二个 incoming（回边）——finalize_
+// loop_header_phis 需要知道"回去补哪一条"，这三个字段就是定位信息：
+// 插在哪个块（header_block）、块里第几条语句（stmt_index，Vec 下标，
+// 插入时就是 push 之前的长度）、对应哪个变量（base_id）。
+struct LoopPhiInfo {
+    header_block: usize,
+    stmt_index: usize,
+    base_id: usize,
 }
 
 // ===== 重构：把"发散"变成显式返回值，不再靠类型层反推 =====
@@ -104,21 +116,28 @@ pub(crate) type ExprResult = Diverging<MirOperand>;
 pub(crate) type RvalueResult = Diverging<MirRvalue>;
 pub(crate) type BlockResult = Diverging<Option<MirOperand>>;
 
-// 在拿到某个子构建的 Diverging<T> 结果、但需要的是里面的值 T 本身时
-// 展开：正常就把 T 解出来接着用；一旦是 Diverged，直接把
-// `Ok(Diverging::Diverged)` 从*当前函数*整个 return 出去——不需要关心
-// 当前函数的 Diverging<U> 具体是哪个 U，因为 Diverged 这个变体本身不
-// 带数据，塞进哪个 Diverging<U> 都合法，U 由 return 处所在函数的签名
-// 自动推断。这样"见到 Diverged 就不再往下求值，原样传播"这句话只用在
-// 这一个宏里写一次，几十个调用点都只需要一行
-// `propagate!(self.build_xxx(...)?)`。
-macro_rules! propagate {
-    ($e:expr) => {
-        match $e {
-            Diverging::Value(v) => v,
-            Diverging::Diverged => return Ok(Diverging::Diverged),
-        }
-    };
+// 关键重构（去掉 macro_rules!）：项目里明确不用 Rust 的任何宏（包括
+// matches!）——check_type.rs / intrinsic.rs / check_model.rs 都专门为
+// 这条规矩改过代码。这里原来为了不在几十个调用点重复"见到 Diverged
+// 就 return"这句话，加了一个 `propagate!` 宏，属于重新破例。
+//
+// 换成一个普通泛型函数：把 `Diverging<T>` 转成标准库的 `Result<T, ()>`
+// ——正常求值是 `Ok(v)`，发散是 `Err(())`（不需要在 Err 里带上
+// `Diverging::Diverged` 本身，调用点只关心"是不是发散了"这一件事，
+// `()` 已经完整表达了这件事，不用再包一层同义的类型）。
+//
+// 但函数没法替宏做到"从调用方所在的函数提前 return"这件事——`return`
+// 只能出现在字面写着它的那个函数体里，一个被调用的普通函数即使自己
+// 执行了 `return`，退出的也只是它自己，不会影响调用方。所以这个函数
+// 只负责"分类"（是 Value 还是 Diverged），调用点仍然要自己写一个
+// `match`，在 Err 分支里显式 `return Ok(Diverging::Diverged)`——这跟
+// 宏展开出来的代码在运行时效果一致，只是不再靠宏做代码复制，而是每个
+// 调用点都老老实实写一遍这几行。
+pub(crate) fn propagated<T>(r: Diverging<T>) -> Result<T, ()> {
+    match r {
+        Diverging::Value(v) => Ok(v),
+        Diverging::Diverged => Err(()),
+    }
 }
 
 pub struct MirBuilder {
@@ -312,23 +331,33 @@ impl MirBuilder {
         // 查一遍函数签名的 return_type 是不是 Type::Never，才知道函数体
         // 正常"掉出"最后一句时该塞一个 Unreachable 还是 Return(ret)——
         // 这是从签名反推控制流。现在不用反推了：build_block 会通过
-        // Diverging 把"函数体是不是真的处处发散"结构化地带出来——如果
-        // 是，发散发生的那一刻（Return 语句本身、Break 语句本身、或
-        // build_expr_rvalue 里那次 Never 调用）已经把当时的 current_block
-        // 设成了真正的终止器，current_terminator_is_placeholder() 到这里
-        // 必然是 false，下面这个 if 根本不会执行，用不着再去看
-        // f.return_type 是不是 Never。如果函数体没有处处发散（sema 应该
-        // 已经保证 Never 函数的每条路径都会发散，不负责在这里重新验证
-        // 这份保证)，那 ret 就是真正落到函数体尾部的值，正常 Return 就是
-        // 对的，不需要另外分支。
+        // Diverging 把"函数体是不是真的处处发散"结构化地带出来。
+        //
+        // 关键重构（这里曾经因为 Unreachable/Placeholder 没分开而出过
+        // 一次真 bug，现在补一句说明这条判断为什么现在是安全的）：
+        // 曾经有一版实现，无论 build_block 返回 Diverging::Value 还是
+        // Diverging::Diverged，都无条件调用
+        // `current_block_terminator_is_unset()` 来决定要不要
+        // `set_terminator(Return(ret))`——那时候"占位符"和"发散源头
+        // 设置的真终止器"共用同一个值（Unreachable），比如
+        // `fn foo() -> i32 { panic("x") }`：build_block 返回
+        // Diverging::Diverged，但当时的判断读到的 Unreachable 跟"这个
+        // 块从没被设置过"是同一个值，分不出来，于是把发散源头正确
+        // 设置的 Unreachable 硬生生覆盖成 `Return(None)`，生成的 Rust
+        // 里出现 `return;`，在声明返回 i32 的函数里编译不过。
+        //
+        // 现在 mir.rs 把"占位"（Placeholder）和"已知不可达"
+        // （Unreachable）拆成了两个不同的终止器变体，
+        // `current_block_terminator_is_unset()` 问的是"是不是
+        // Placeholder"，不再跟 Unreachable 混在一起——Diverged 分支下，
+        // 发散源头设置的终止器（不管是 Unreachable、Return 还是 Goto）
+        // 都不是 Placeholder，这个判断在两个分支下都天然给出正确答案，
+        // 不需要再靠 match Diverging 的哪个变体来人工避开这个歧义。
         let ret = match builder.build_block(&f.body, shared)? {
             Diverging::Value(v) => v,
-            // 占位：走到这个分支说明函数体处处发散，
-            // current_terminator_is_placeholder() 此时必然是 false，
-            // 下面的 if 不会执行，这个 None 不会被用到。
             Diverging::Diverged => None,
         };
-        if builder.current_terminator_is_placeholder() {
+        if builder.current_block_terminator_is_unset() {
             builder.set_terminator(MirTerminator::Return(ret));
         }
 
@@ -347,8 +376,16 @@ impl MirBuilder {
         self.push_scope();
         let mut last: Option<MirOperand> = None;
         for stmt in &block.stmts {
-            match self.build_stmt(stmt, shared)? {
-                Diverging::Diverged => {
+            // 关键修复：原来是 `match self.build_stmt(stmt, shared)? {
+            // ... }`——`?` 在 Err 分支直接把 Err(String) 从 build_block
+            // 整个 return 出去，不会走到任何一个分支里的 `pop_scope()`，
+            // 上面 push_scope 开的这层作用域就永远不会被弹掉。跟
+            // build_rvalue_expr_and_pop_scope 是同一类问题：先把结果存
+            // 起来，不管是 Err 还是 Diverged 都先 pop_scope，再决定
+            // 是把错误传播出去还是继续这一轮循环。
+            let stmt_result = self.build_stmt(stmt, shared);
+            match stmt_result {
+                Ok(Diverging::Diverged) => {
                     // 关键重构：这条语句已经发散了（不管是 Return/Break，
                     // 还是内部某个子表达式碰到了一次 Never 调用），这个
                     // 块从这里往后的语句在真实控制流里根本不会被执行到。
@@ -362,8 +399,12 @@ impl MirBuilder {
                     self.pop_scope();
                     return Ok(Diverging::Diverged);
                 }
-                Diverging::Value(v) => {
+                Ok(Diverging::Value(v)) => {
                     last = v;
+                }
+                Err(e) => {
+                    self.pop_scope();
+                    return Err(e);
                 }
             }
         }
@@ -382,7 +423,10 @@ impl MirBuilder {
                 // 不会被赋值的变量赋一个不存在的值）。现在 init 发散时
                 // build_expr 会如实带出 Diverged，这里直接原样传播——
                 // 不创建这个 local，也不生成这条 Assign。
-                let value = propagate!(self.build_expr(init, shared)?);
+                let value = match propagated(self.build_expr(init, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 let local_ty = ty.clone().unwrap_or_else(|| init.ty.clone());
                 let id = if *persist {
                     self.new_persist_local(Some(name.clone()), local_ty, *mutable)
@@ -416,6 +460,19 @@ impl MirBuilder {
                 match self.build_expr_rvalue(expr, shared)? {
                     Diverging::Diverged => Ok(Diverging::Diverged),
                     Diverging::Value(value) => {
+                        // 关键修复：这里直接消费 build_expr_rvalue 的
+                        // 结果，绕开了 build_expr 尾部那次统一的
+                        // mark_moved_operand 调用（见那边新加的说明）。
+                        // 大多数语句表达式（Call/BinaryOp/……）的顶层
+                        // rvalue 不是裸 Use，这里不受影响；但如果这条
+                        // 语句就是一个整个被丢弃结果的 if/match 表达式
+                        // （`if c { a } else { b };`），value 会是
+                        // `Use(Move(Ssa(phi_ssa)))`——phi_ssa 这次被
+                        // ExprStmt 消费掉了，同样需要登记进 moved，不然
+                        // 它的作用域结束时会被重复 Drop。
+                        if let MirRvalue::Use(operand) = &value {
+                            self.mark_moved_operand(operand);
+                        }
                         self.push_stmt(MirStmt::ExprStmt(value));
                         Ok(Diverging::Value(None))
                     }
@@ -436,7 +493,10 @@ impl MirBuilder {
                 // 栈上变量"的逻辑，在"根本没有正常返回这回事"的场景下
                 // 也没有意义，不该执行。
                 let operand = match expr.as_ref() {
-                    Some(e) => Some(propagate!(self.build_expr(e, shared)?)),
+                    Some(e) => Some(match propagated(self.build_expr(e, shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    }),
                     None => None,
                 };
 
@@ -455,7 +515,10 @@ impl MirBuilder {
                 // （比如 `arr[panic()] = 5;` 的下标表达式），guide.rs 的
                 // build_place 现在也走同一套 Diverging 传播，这里跟其他
                 // 地方一样，见到 Diverged 就不再往下求值。
-                let place = propagate!(self.build_place(target, shared)?);
+                let place = match propagated(self.build_place(target, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 // 如果目标是 Ssa，则递增版本；否则（字段/索引等）保留原样
                 let dest = match place {
                     MirPlace::Ssa(ssa) => {
@@ -464,7 +527,19 @@ impl MirBuilder {
                     }
                     _ => place,
                 };
-                let value = propagate!(self.build_expr_rvalue(expr, shared)?);
+                let value = match propagated(self.build_expr_rvalue(expr, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
+                // 关键修复：同 HirStmt::Expr 那处——这里直接消费
+                // build_expr_rvalue 的结果，绕开了 build_expr 尾部的
+                // mark_moved_operand。`x = if c { a } else { b };` 这类
+                // 写法，value 会是 `Use(Move(Ssa(phi_ssa)))`，phi_ssa
+                // 在这里被真正消费（赋给 dest），必须登记进 moved，
+                // 否则它的作用域结束时会被重复 Drop。
+                if let MirRvalue::Use(operand) = &value {
+                    self.mark_moved_operand(operand);
+                }
                 self.push_stmt(MirStmt::Assign { dest, value });
                 Ok(Diverging::Value(None))
             }
@@ -473,10 +548,45 @@ impl MirBuilder {
                 let body_block = self.new_block();
                 let end_block = self.new_block();
 
+                // 关键新增（循环头 Phi）：保存 preheader 块 id——这是
+                // 进入循环之前所在的那个块，也是循环头 Phi 的第一个
+                // incoming 来源。必须在 `set_terminator(Goto(cond_block))`
+                // 之前读，那之后 self.current_block 还是这个块，只是
+                // 即将被賦予一个真终止器，读它的 id 不受影响，但为了
+                // 代码顺序清晰，习惯性地在改动它之前先把 id 存下来。
+                let preheader_block = self.current_block;
+
                 self.set_terminator(MirTerminator::Goto(cond_block));
 
                 self.switch_to_block(cond_block);
-                let cond_operand = propagate!(self.build_expr(cond, shared)?);
+                // 关键新增：在 cond_block 最前面插入循环头 Phi——此时
+                // cond_block 里还没有任何语句（下面这行才开始求值
+                // cond），插入操作等价于"放在最前面"。
+                //
+                // 为什么循环需要 Phi：MirBuilder 的 SSA 是直线代码
+                // 版——同一个 base_id 每被 Assign 一次就 new_version，
+                // current_ssa(base_id) 返回"最后一次赋值对应的版本"。
+                // 这对顺序执行的代码没问题，但循环有一条"回边"（body
+                // 执行完跳回 cond_block），循环第二轮开始时，cond_block
+                // 里读到的 base_id 应该是"上一轮循环体结束时的值"，不是
+                // "进入循环之前的值"——直线 SSA 表达不出"这个值取决于
+                // 我们是第一次到这里、还是绕了一圈回来的"这种二义性，
+                // 必须在循环头显式插入 Phi 节点，两个 incoming 分别对应
+                // "从 preheader 进来"和"从循环体尾部绕回来"这两条边。
+                // 这也是为支配树、GVN、SCCP（稀疏条件常量传播）、聚合
+                // 常量折叠这些后续要做的分析做准备——它们都要求输入是
+                // 规范的 SSA 形式，循环头没有 Phi 的话，"同一个变量在
+                // 不同到达路径上可能取不同值"这件事根本没有被表达出来。
+                let loop_phis = self.insert_loop_header_phis(preheader_block, body);
+
+                // 求值 cond——现在读到 body 里被修改过的变量，读到的是
+                // 上面刚插入的 phi 版本（insert_loop_header_phis 内部
+                // 调用 new_version 时已经更新了 self.ssa_versions，
+                // current_ssa 自然返回 phi 版本），是正确的。
+                let cond_operand = match propagated(self.build_expr(cond, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 self.set_terminator(MirTerminator::If {
                     cond: cond_operand,
                     then_block: body_block,
@@ -489,23 +599,44 @@ impl MirBuilder {
                 // push_loop 记的 scope_depth 是"body 自己的 push_scope
                 // 还没发生"时的深度，build_block 马上会 push 一层，跟
                 // Break 分支里"该 Drop 到哪一层为止"的计算对得上。
+                //
+                // 关键修复（? 跳过 pop_loop）：原来这里是
+                // `self.build_block(body, shared)?;`——`?` 在 Err 分支
+                // 直接把整个函数 return 掉，不会走到下面的
+                // `self.pop_loop()`，loop_stack 就会残留一层。当前"整个
+                // 编译失败就直接退出"的架构掩盖了这个问题（反正马上就
+                // 不再使用这个 MirBuilder 了），但不能依赖这个前提——
+                // 先存住结果，无论如何先 pop_loop，再 `?`。
                 self.push_loop(end_block);
                 let body_result = self.build_block(body, shared);
                 self.pop_loop();
-                // 关键重构：body 是不是发散不影响 while 语句本身要不要
-                // 报告发散——while 循环即使 body 每一轮都走 break/return
-                // 收尾，循环外仍然可能通过"条件一开始就为假"这条路径
-                // 直接落到 end_block，所以 while 语句永远不发散（跟原来
-                // 的行为一致）。这里只需要 `?` 把 build_block 内部真正
-                // 的错误（Err）传出去，不需要关心 Diverging 是 Value 还是
-                // Diverged——不管哪种，下面的 current_terminator_is_placeholder
-                // 检查都会给出正确答案：body 正常掉出来就还是占位符，
-                // 该接 Goto(cond_block)；body 里已经发散（比如恰好以
-                // break 收尾）就已经是真终止器，这里的 if 自然跳过，不会
-                // 覆盖掉刚设好的正确终止器。
-                body_result?;
-                if self.current_terminator_is_placeholder() {
-                    self.set_terminator(MirTerminator::Goto(cond_block));
+                let body_result = body_result?;
+
+                // 关键说明：body 是不是发散不影响 while 语句本身要不要
+                // 报告发散——循环外仍然可能通过"条件一开始就为假"这条
+                // 路径直接落到 end_block，while 语句永远不发散，这一点
+                // 跟原来的设计意图一致。
+                //
+                // 关键新增（回填循环头 Phi 的第二个 incoming）：只有
+                // body 正常掉出尾部、且尾部所在的块此刻还没有真正的
+                // 终止器时，才存在一条"循环体跑完、回去重新判断条件"的
+                // 回边——这时候才需要把这条回边记进 Phi。如果 body 以
+                // break/return/一次无条件发散收尾，尾部所在的块已经有
+                // 了明确的终止器（Goto(end_block)/Return(..)/
+                // Unreachable 之一），根本不会 Goto 回 cond_block，也就
+                // 没有这条回边，Phi 就只保留 insert_loop_header_phis
+                // 那时候插入的第一个 incoming，退化成单路 Phi——后续
+                // control::simplify 的 simplify_phi 会把这种单路 Phi
+                // 折叠回一次普通的 Use，不需要 mir_builder.rs 这里操心。
+                match body_result {
+                    Diverging::Value(_) => {
+                        if self.current_block_terminator_is_unset() {
+                            let back_edge_block = self.current_block;
+                            self.set_terminator(MirTerminator::Goto(cond_block));
+                            self.finalize_loop_header_phis(&loop_phis, back_edge_block);
+                        }
+                    }
+                    Diverging::Diverged => {}
                 }
 
                 self.switch_to_block(end_block);
@@ -515,20 +646,37 @@ impl MirBuilder {
                 let body_block = self.new_block();
                 let end_block = self.new_block();
 
+                let preheader_block = self.current_block;
+
                 self.set_terminator(MirTerminator::Goto(body_block));
                 self.switch_to_block(body_block);
-                // 同 While 分支：进 body 之前 push，出来之后 pop。
+                // 同 While 分支：body_block 兼任循环头，Phi 插在这里
+                // 最前面。跟 While 不同的是，body_block 里马上会开始
+                // 塞循环体自己的语句（没有单独的 cond_block），但
+                // insert_loop_header_phis 此刻调用时 body_block 依然
+                // 是空的（body 还没开始构建），插入操作同样等价于
+                // "放在最前面"。
+                let loop_phis = self.insert_loop_header_phis(preheader_block, body);
+
                 self.push_loop(end_block);
                 let body_result = self.build_block(body, shared);
                 self.pop_loop();
+                let body_result = body_result?;
+
                 // 同 While 分支的说明：loop 语句本身是否发散跟 body 的
                 // Diverging 结果无关（这里选择跟原来的行为一致，仍然不
                 // 尝试证明"这个裸 loop 里到处都没有 break、因此整个 loop
                 // 语句真的发散"——那是一个独立的、这次不做的分析，跟
                 // Type::Never 特判去留没有关系）。
-                body_result?;
-                if self.current_terminator_is_placeholder() {
-                    self.set_terminator(MirTerminator::Goto(body_block));
+                match body_result {
+                    Diverging::Value(_) => {
+                        if self.current_block_terminator_is_unset() {
+                            let back_edge_block = self.current_block;
+                            self.set_terminator(MirTerminator::Goto(body_block));
+                            self.finalize_loop_header_phis(&loop_phis, back_edge_block);
+                        }
+                    }
+                    Diverging::Diverged => {}
                 }
 
                 self.switch_to_block(end_block);
@@ -573,8 +721,16 @@ impl MirBuilder {
             HirStmt::UnsafeBlock { body, .. } => {
                 self.unsafe_depth += 1;
                 self.push_stmt(MirStmt::EffectCheck { effect: "unsafe".to_string() });
-                let result = self.build_block(body, shared)?;
+                // 关键修复：原来是 `let result = self.build_block(body,
+                // shared)?;`——`?` 在 Err 分支直接 return，跳过下面的
+                // `self.unsafe_depth -= 1`，这个计数器就再也降不回去了，
+                // 会让后续（如果流水线在同一次编译里还会继续构建别的
+                // 函数）所有代码都被误判成"处于 unsafe 上下文"。跟前面
+                // 几处一样：先存住结果，无论如何先把 depth 降回去，再
+                // 决定要不要把错误传播出去。
+                let result = self.build_block(body, shared);
                 self.unsafe_depth -= 1;
+                let result = result?;
                 // 注意：UnsafeBlock 本身是一个语句，它不能产生一个
                 // MirOperand 结果，所以直接把 build_block 的 BlockResult
                 // 原样转发——包括发散信息：unsafe { panic(); } 作为语句
@@ -606,19 +762,43 @@ impl MirBuilder {
         // = rvalue { return Ok(operand); }` 会原样把这个 operand 展开
         // 返回——跟删之前的特判行为完全一致，只是现在只有一个地方
         // 写着"Ident 该怎么处理"。
-        let rvalue = propagate!(self.build_expr_rvalue(expr, shared)?);
+        let rvalue = match propagated(self.build_expr_rvalue(expr, shared)?) {
+            Ok(v) => v,
+            Err(()) => return Ok(Diverging::Diverged),
+        };
         // 已经是 Use(operand) 的情况，直接展开，不用画蛇添足再包一层
         // 临时变量。
-        if let MirRvalue::Use(operand) = rvalue {
-            return Ok(Diverging::Value(operand));
-        }
-        let temp = self.new_temp(expr.ty.clone());
-        let version = self.ssa_versions.get(&temp).copied().unwrap_or(0);
-        let new_version = version + 1;
-        self.ssa_versions.insert(temp, new_version);
-        let dest = MirPlace::Ssa(SsaLocal { base_id: temp, version: new_version });
-        self.push_stmt(MirStmt::Assign { dest, value: rvalue });
-        Ok(Diverging::Value(MirOperand::Move(MirPlace::Ssa(SsaLocal { base_id: temp, version: new_version }))))
+        let operand = if let MirRvalue::Use(operand) = rvalue {
+            operand
+        } else {
+            let temp = self.new_temp(expr.ty.clone());
+            let version = self.ssa_versions.get(&temp).copied().unwrap_or(0);
+            let new_version = version + 1;
+            self.ssa_versions.insert(temp, new_version);
+            let dest = MirPlace::Ssa(SsaLocal { base_id: temp, version: new_version });
+            self.push_stmt(MirStmt::Assign { dest, value: rvalue });
+            MirOperand::Move(MirPlace::Ssa(SsaLocal { base_id: temp, version: new_version }))
+        };
+        // 关键修复：这次求值即将把 operand 交给调用方，调用方接下来会
+        // 把它嵌进自己的表达式树（当函数实参、当另一个 BinaryOp 的
+        // 操作数……），这个 operand 指向的变量的值就已经被这次求值
+        // "取走"了。如果这个 operand 恰好是对某个 Ssa 局部变量的
+        // Move，就必须在这里登记进 moved——不然这个变量的作用域结束
+        // 时，pop_scope 会以为它还没被动过，照常补一条 Drop，对一个
+        // 已经被移动走的值重复调用 drop()，生成的 Rust 编译不过。
+        //
+        // 这条登记原来只在 build_expr_rvalue 的 Ident/FieldAccess/Index
+        // 几个分支里各自写了一遍，唯独漏了这里——也就是"上面刚刚新建
+        // 的临时变量"（承接 BinaryOp/Call/StructInit/……这些 rvalue 的
+        // __tmp）和"rvalue 本来就已经是 Use(Move(Ssa(..))) 的情况"（比如
+        // if/match 表达式汇合各分支值之后的 Phi 结果，经上面的
+        // `if let MirRvalue::Use(operand) = rvalue` 直接展开出来）这两
+        // 类：它们都会被 new_temp 登记进当前作用域的 scope_vars 等着
+        // 被 Drop，却从没有在"值被交出去"的这一刻被标记过 moved。对
+        // 已经在别处标记过的 ssa（比如这里 operand 其实来自一次 Ident
+        // 读取）再插一次是幂等的，不会有副作用。
+        self.mark_moved_operand(&operand);
+        Ok(Diverging::Value(operand))
     }
 
     // build_expr_rvalue：跟 build_expr 的区别是不强制把结果落进临时
@@ -637,21 +817,42 @@ impl MirBuilder {
                 Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(ssa)))))
             }
             HirExprKind::Sym(name) => {
-                // Sym 目前当成一个不可变的具名静态引用处理，精确的
+                // Sym 目前当成一个不可变的具名符号引用处理，精确的
                 // 编译期符号求解语义留给 calc.rs/simplify.rs 之后接手。
-                Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Static(name.clone())))))
+                //
+                // 关键重构（Sym 搬家：MirPlace → MirOperand）：Sym<B>
+                // 里的 B 是一个值——一个 usize，只是具体数值要留到 JIT
+                // 期才能绑定，跟 Literal::Usize(32) 是同一类东西——不是
+                // "能被赋值/取地址的位置"：不能写 `B = 5;`，不能借用，
+                // 不需要 Drop。之前它被塞进 MirPlace::Sym、再用
+                // MirOperand::Move 包一层去"读"它，是在假装它是内存里的
+                // 一个变量；现在 mir.rs 把它挪进了 MirOperand 自己的
+                // 变体，不再需要 Move/Copy 这层假装，直接构造。
+                Ok(Diverging::Value(MirRvalue::Use(MirOperand::Sym(name.clone()))))
             }
             HirExprKind::BinaryOp { op, left, right } => {
-                let l = propagate!(self.build_expr(left, shared)?);
-                let r = propagate!(self.build_expr(right, shared)?);
+                let l = match propagated(self.build_expr(left, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
+                let r = match propagated(self.build_expr(right, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 Ok(Diverging::Value(MirRvalue::BinaryOp(op.clone(), l, r)))
             }
             HirExprKind::Unary { op, expr: inner } => {
-                let operand = propagate!(self.build_expr(inner, shared)?);
+                let operand = match propagated(self.build_expr(inner, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 Ok(Diverging::Value(MirRvalue::UnaryOp(op.clone(), operand)))
             }
             HirExprKind::Cast { expr: inner, ty } => {
-                let operand = propagate!(self.build_expr(inner, shared)?);
+                let operand = match propagated(self.build_expr(inner, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 Ok(Diverging::Value(MirRvalue::Cast(operand, ty.clone())))
             }
             HirExprKind::FieldAccess { .. } | HirExprKind::Index { .. } => {
@@ -659,7 +860,10 @@ impl MirBuilder {
                 // 现在也走 Diverging 传播（下标表达式本身可能发散，比如
                 // `arr[panic()]`），这里跟别处一样，见到 Diverged 就
                 // 原样传播。
-                let place = propagate!(self.build_place(expr, shared)?);
+                let place = match propagated(self.build_place(expr, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 // 关键修复：读一个字段/下标也是对底层变量的一次移动
                 // （部分移动），跟裸 Ident 读取一样得登记进 moved——不然
                 // pop_scope 会在这个变量离开作用域时照常插一条 Drop，
@@ -684,7 +888,10 @@ impl MirBuilder {
                             // 处理过。现在参数发散时直接原样传播，不继续
                             // 构造这个枚举变体，也不再尝试求值后面的
                             // 参数（真实控制流里它们根本不会被求值到）。
-                            mir_args.push(propagate!(self.build_call_arg(a, shared)?));
+                            mir_args.push(match propagated(self.build_call_arg(a, shared)?) {
+                                Ok(v) => v,
+                                Err(()) => return Ok(Diverging::Diverged),
+                            });
                         }
                         // 关键修复：这条路径处理的正是最常见的写法——
                         // `Ok(x)`/`Some(x)` 这种裸调用——而不是走
@@ -706,10 +913,16 @@ impl MirBuilder {
                     if args.is_empty() {
                         return Err("method call requires a receiver".to_string());
                     }
-                    let receiver = propagate!(self.build_call_arg(&args[0], shared)?);
+                    let receiver = match propagated(self.build_call_arg(&args[0], shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    };
                     let mut mir_args = Vec::new();
                     for a in &args[1..] {
-                        mir_args.push(propagate!(self.build_call_arg(a, shared)?));
+                        mir_args.push(match propagated(self.build_call_arg(a, shared)?) {
+                            Ok(v) => v,
+                            Err(()) => return Ok(Diverging::Diverged),
+                        });
                     }
                     return Ok(Diverging::Value(MirRvalue::MethodCall {
                         receiver,
@@ -728,7 +941,7 @@ impl MirBuilder {
                 //    (false, None)，会一路落进最后"当成普通函数调用"的
                 //    通用分支，生成出 `MAX()` 这种把常量当零参函数调用
                 //    的假代码——常量不该走 MirRvalue::Call 这条路，
-                //    MirPlace::Static 才是它本该落的地方。
+                //    MirOperand::Static 才是它本该落的地方。
                 //
                 // 关键修复（这次拆分）：常量检测和内建函数检测这两段
                 // 逻辑挪到了 intrinsic.rs 的 try_resolve_constant_ref /
@@ -737,12 +950,19 @@ impl MirBuilder {
                 // 两个状态位（in_forward/unsafe_depth），所以 intrinsic.rs
                 // 不用反过来认识 MirBuilder/mir.rs 的类型，具体原因见
                 // 那两个函数上面的注释。
+                //
+                // 关键重构（Static 搬家：MirPlace → MirOperand）：跟
+                // 上面 Sym 那处是同一个道理——i128::MAX 这类内建关联
+                // 常量是一个值，不是"位置"，虽然它的字符串碰巧是合法
+                // 的 Rust 路径、可以直接裸写，但这是 codegen 的实现
+                // 细节，不该让 MIR 层为了这个巧合套一层 Move 假装在读
+                // 某个变量。
                 if let Some(const_name) = crate::intrinsic::try_resolve_constant_ref(
                     qualifier, func, *is_method, args.len(),
                 ) {
-                    return Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Static(
+                    return Ok(Diverging::Value(MirRvalue::Use(MirOperand::Static(
                         const_name.to_string(),
-                    )))));
+                    ))));
                 }
 
                 // 4) 真正的内建/固有函数：查 intrinsic.rs 的注册表。
@@ -757,7 +977,10 @@ impl MirBuilder {
                 };
                 let mut mir_args = Vec::new();
                 for a in args {
-                    mir_args.push(propagate!(self.build_call_arg(a, shared)?));
+                    mir_args.push(match propagated(self.build_call_arg(a, shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    });
                 }
                 let call_rvalue = MirRvalue::Call {
                     func: full_name,
@@ -791,7 +1014,10 @@ impl MirBuilder {
             HirExprKind::EnumVariantConstruction { enum_name, generic_args, variant_name, args } => {
                 let mut mir_args = Vec::new();
                 for a in args {
-                    mir_args.push(propagate!(self.build_call_arg(a, shared)?));
+                    mir_args.push(match propagated(self.build_call_arg(a, shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    });
                 }
                 // 关键修复：这里原来用 `..` 把 HIR 节点自带的 generic_args
                 // 直接丢掉了——sema 已经推导出 Some(x)/Ok(x) 这类构造具体
@@ -821,7 +1047,10 @@ impl MirBuilder {
             HirExprKind::StructInit { struct_name, generic_args, fields } => {
                 let mut mir_fields = Vec::new();
                 for (name, e) in fields {
-                    mir_fields.push((name.clone(), propagate!(self.build_expr(e, shared)?)));
+                    mir_fields.push((name.clone(), match propagated(self.build_expr(e, shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    }));
                 }
                 // 关键修复：同上，原来 `..` 把 generic_args 丢了。
                 Ok(Diverging::Value(MirRvalue::StructInit {
@@ -833,7 +1062,10 @@ impl MirBuilder {
             HirExprKind::ArrayLiteral(elements) => {
                 let mut mir_elements = Vec::new();
                 for e in elements {
-                    mir_elements.push(propagate!(self.build_expr(e, shared)?));
+                    mir_elements.push(match propagated(self.build_expr(e, shared)?) {
+                        Ok(v) => v,
+                        Err(()) => return Ok(Diverging::Diverged),
+                    });
                 }
                 Ok(Diverging::Value(MirRvalue::ArrayLiteral(mir_elements)))
             }
@@ -849,9 +1081,12 @@ impl MirBuilder {
             HirExprKind::UnsafeBlock { body, .. } => {
                 self.unsafe_depth += 1;
                 self.push_stmt(MirStmt::EffectCheck { effect: "unsafe".to_string() });
-                let last = self.build_block(body, shared)?;
+                // 关键修复：同 HirStmt::UnsafeBlock 那处——原来的 `?`
+                // 会在 Err 时跳过 `self.unsafe_depth -= 1`，让计数器
+                // 泄漏。先存住结果，无条件把 depth 降回去，再 `?`。
+                let last = self.build_block(body, shared);
                 self.unsafe_depth -= 1;
-                match last {
+                match last? {
                     Diverging::Diverged => Ok(Diverging::Diverged),
                     Diverging::Value(last) => Ok(Diverging::Value(MirRvalue::Use(
                         last.unwrap_or(MirOperand::Constant(crate::ast::Literal::Unit)),
@@ -859,16 +1094,14 @@ impl MirBuilder {
                 }
             }
             HirExprKind::If { kind: _, cond, then_expr, else_expr } => {
-                let cond_operand = propagate!(self.build_expr(cond, shared)?);
+                let cond_operand = match propagated(self.build_expr(cond, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 let then_block = self.new_block();
                 let else_block = self.new_block();
                 let end_block = self.new_block();
                 self.set_terminator(MirTerminator::If { cond: cond_operand, then_block, else_block });
-
-                // 目标变量的 base_id（不分配版本）
-                let dest_base = self.new_temp(expr.ty.clone());
-                let mut then_info = None;
-                let mut else_info = None;
 
                 // ---------- Then 分支 ----------
                 // 关键重构（Type::Never 去特判化）：原来这里要先查一遍
@@ -876,88 +1109,105 @@ impl MirBuilder {
                 // 从类型层反推控制流。现在 build_expr 自己会在真正发散
                 // 的源头（build_expr_rvalue 里那次 Never 调用）把这件事
                 // 结构化地带出来，这里直接看 Diverging 的哪个变体就行。
-                // 发散那支下面什么都不用做——终止器已经在更深处被设成
-                // Unreachable 了，也没有值可以送进下面的 Phi。
                 self.switch_to_block(then_block);
-                match self.build_expr(then_expr, shared)? {
-                    Diverging::Diverged => {}
-                    Diverging::Value(then_operand) => {
-                        let then_ver = self.new_version(dest_base);
-                        let then_ssa = SsaLocal { base_id: dest_base, version: then_ver };
-                        self.push_stmt(MirStmt::Assign {
-                            dest: MirPlace::Ssa(then_ssa),
-                            value: MirRvalue::Use(then_operand),
-                        });
-                        then_info = Some((then_block, then_ssa));
-                        if self.current_terminator_is_placeholder() {
-                            self.set_terminator(MirTerminator::Goto(end_block));
-                        }
-                    }
-                }
+                let then_result = self.build_expr(then_expr, shared)?;
+                // 关键修复：then_expr 内部如果自己还有嵌套的 if/match/
+                // block（比如 `if a { if b { 1 } else { 2 } } else {
+                // ... }`），build_expr 求值完之后 self.current_block 已经
+                // 不是这里的 then_block 了，而是那层嵌套控制流自己的
+                // end_block——真正该往里面写 Assign、真正该记进 Phi
+                // 来源的，是这个"最终块"，不是最初 switch_to_block 进去
+                // 的 then_block。原来的实现直接假设两者永远是同一个块，
+                // 对不含嵌套控制流的简单分支碰巧是对的，但对这种嵌套
+                // 场景会往错误的块（早已经跑完、甚至终止器已经设定好
+                // 的 then_block）里补语句、往 Phi 里记一个从来不是真正
+                // 前驱的块 id，两者都是错的。
+                let then_final_block = self.current_block;
 
                 // ---------- Else 分支 ----------
                 self.switch_to_block(else_block);
-                match else_expr {
-                    Some(e) => {
-                        match self.build_expr(e, shared)? {
-                            Diverging::Diverged => {}
-                            Diverging::Value(else_operand) => {
-                                let else_ver = self.new_version(dest_base);
-                                let else_ssa = SsaLocal { base_id: dest_base, version: else_ver };
-                                self.push_stmt(MirStmt::Assign {
-                                    dest: MirPlace::Ssa(else_ssa),
-                                    value: MirRvalue::Use(else_operand),
-                                });
-                                else_info = Some((else_block, else_ssa));
-                                if self.current_terminator_is_placeholder() {
-                                    self.set_terminator(MirTerminator::Goto(end_block));
-                                }
+                let else_result = match else_expr {
+                    Some(e) => self.build_expr(e, shared)?,
+                    // 没有 else 分支：sema 保证 then 分支是 Unit，这里
+                    // 直接给一个 Unit 常量当 else 分支的"值"，不需要真的
+                    // build 什么，也不可能发散。
+                    None => Diverging::Value(MirOperand::Constant(crate::ast::Literal::Unit)),
+                };
+                let else_final_block = self.current_block;
+
+                // 关键修复：dest_base 原来在两个分支求值之前就无条件
+                // `self.new_temp(...)` 创建好——new_temp 会把它登记进
+                // 当前作用域的 scope_vars。如果两个分支都发散（比如
+                // `if c { panic() } else { panic() }`），下面两个分支都
+                // 走不到"产生值"的路径，dest_base 从头到尾没有任何一条
+                // Assign 语句给它赋值，但它已经作为"这个作用域里的一个
+                // 变量"被记了下来。等这个作用域将来被 pop_scope /
+                // emit_drops_for_scopes 处理时，会发现 dest_base 的初始
+                // SSA（version 0）没在 moved 里，照常给它插一条
+                // `Drop { place: Ssa(dest_base, 0) }`——生成的 Rust 是对
+                // 一个从来没被初始化过的变量调用 drop()，"borrow of
+                // possibly-uninitialized variable"，编译不过。
+                //
+                // 修法：把 dest_base 的创建推迟到"确认至少有一个分支真的
+                // 产生了值"之后——两个分支都发散时，压根不调用
+                // `new_temp`，从根上不让这个"注册了但从没被赋值"的临时
+                // 变量存在。判断"两者是否都发散"需要先把 then_result/
+                // else_result 摆在一起 match 一次，所以下面按值（不是按
+                // 引用）消费掉它们。
+                match (then_result, else_result) {
+                    (Diverging::Diverged, Diverging::Diverged) => {
+                        // 两个分支都发散：整个 if 表达式也是发散的，原样
+                        // 传播给上一层，不创建 dest_base，也不需要切到
+                        // end_block——它从此没有任何前驱，是一个真正的
+                        // 死块，会在后续的 control::simplify 里被清理掉，
+                        // 不需要 mir_builder.rs 这里操心。
+                        Ok(Diverging::Diverged)
+                    }
+                    (then_result, else_result) => {
+                        let dest_base = self.new_temp(expr.ty.clone());
+                        let mut phi_values = Vec::new();
+
+                        if let Diverging::Value(then_operand) = then_result {
+                            self.switch_to_block(then_final_block);
+                            let then_ver = self.new_version(dest_base);
+                            let then_ssa = SsaLocal { base_id: dest_base, version: then_ver };
+                            self.push_stmt(MirStmt::Assign {
+                                dest: MirPlace::Ssa(then_ssa),
+                                value: MirRvalue::Use(then_operand),
+                            });
+                            if self.current_block_terminator_is_unset() {
+                                self.set_terminator(MirTerminator::Goto(end_block));
                             }
+                            phi_values.push((then_final_block, MirOperand::Move(MirPlace::Ssa(then_ssa))));
                         }
-                    }
-                    None => {
-                        // 没有 else 分支：sema 保证 then 分支是 Unit，给 dest_base 赋 Unit
-                        let else_ver = self.new_version(dest_base);
-                        let else_ssa = SsaLocal { base_id: dest_base, version: else_ver };
+
+                        if let Diverging::Value(else_operand) = else_result {
+                            self.switch_to_block(else_final_block);
+                            let else_ver = self.new_version(dest_base);
+                            let else_ssa = SsaLocal { base_id: dest_base, version: else_ver };
+                            self.push_stmt(MirStmt::Assign {
+                                dest: MirPlace::Ssa(else_ssa),
+                                value: MirRvalue::Use(else_operand),
+                            });
+                            if self.current_block_terminator_is_unset() {
+                                self.set_terminator(MirTerminator::Goto(end_block));
+                            }
+                            phi_values.push((else_final_block, MirOperand::Move(MirPlace::Ssa(else_ssa))));
+                        }
+
+                        // ---------- End 块：插入 Phi ----------
+                        self.switch_to_block(end_block);
+                        // phi_values 不可能为空：上面已经把"两者都发散"的
+                        // 情况单独处理并提前返回，走到这个分支至少有一个
+                        // 分支贡献了值。
+                        let phi_ver = self.new_version(dest_base);
+                        let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
                         self.push_stmt(MirStmt::Assign {
-                            dest: MirPlace::Ssa(else_ssa),
-                            value: MirRvalue::Use(MirOperand::Constant(crate::ast::Literal::Unit)),
+                            dest: MirPlace::Ssa(phi_ssa),
+                            value: MirRvalue::Phi { values: phi_values },
                         });
-                        else_info = Some((else_block, else_ssa));
-                        if self.current_terminator_is_placeholder() {
-                            self.set_terminator(MirTerminator::Goto(end_block));
-                        }
+                        Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
                     }
-                }
-
-                // ---------- End 块：插入 Phi ----------
-                self.switch_to_block(end_block);
-                let mut phi_values = Vec::new();
-                if let Some((block, ssa)) = then_info {
-                    phi_values.push((block, MirOperand::Move(MirPlace::Ssa(ssa))));
-                }
-                if let Some((block, ssa)) = else_info {
-                    phi_values.push((block, MirOperand::Move(MirPlace::Ssa(ssa))));
-                }
-
-                // 至少有一个分支产生值，就正常插 Phi。
-                if !phi_values.is_empty() {
-                    let phi_ver = self.new_version(dest_base);
-                    let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
-                    self.push_stmt(MirStmt::Assign {
-                        dest: MirPlace::Ssa(phi_ssa),
-                        value: MirRvalue::Phi { values: phi_values },
-                    });
-                    Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
-                } else {
-                    // 关键修复：两个分支都发散时，原来这里是
-                    // unreachable!()——对完全合法的用户代码
-                    // （`if c { panic() } else { panic() }`）来说，这会让
-                    // 编译器自己 panic 崩溃，而不是把这件事如实表达成
-                    // "整个 if 表达式发散"。phi_values 为空恰好就说明了
-                    // 这件事——两个分支都没能贡献值，那么这个 if 表达式
-                    // 本身也是发散的，原样传播给上一层，不再自己 panic。
-                    Ok(Diverging::Diverged)
                 }
             }
             // ===== 明确留白，不是漏改 =====
@@ -971,7 +1221,10 @@ impl MirBuilder {
                 // 路径，分支/解构里都可能要再读一次这个值（枚举取
                 // payload、结构体取字段、数组取下标……），不能在这里就
                 // 把它 Move 掉。
-                let cond_op = propagate!(self.build_expr(cond, shared)?);
+                let cond_op = match propagated(self.build_expr(cond, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
                 let cond_temp = self.new_temp(cond.ty.clone());
                 // 关键修复：原来 `self.new_version(cond_temp)` 是直接内嵌
                 // 在 push_stmt 参数的结构体字面量里算的——push_stmt 的
@@ -1067,25 +1320,11 @@ impl MirBuilder {
                                 ));
                             }
                         }
-                        // 关键重构：这三条"无条件解构"路径（结构体/
-                        // 元组/数组）原来没有任何发散检查——它们不走
-                        // Switch/多分支，只是把 arm.expr 求值当作整个
-                        // match 表达式的值。现在 arm.expr 本身也可能发散
-                        // （比如唯一那条 arm 是 `Point { .. } => panic()`），
-                        // 见到 Diverged 原样传播；pop_scope 无论哪种情况
-                        // 都要执行（作用域配平，且往一个仍然可达的块里
-                        // 补几条 Drop 是无害的死代码，Rust 自己能容忍
-                        // 发散调用之后的不可达语句）。
-                        match self.build_expr(&arm.expr, shared)? {
-                            Diverging::Diverged => {
-                                self.pop_scope();
-                                Ok(Diverging::Diverged)
-                            }
-                            Diverging::Value(operand) => {
-                                self.pop_scope();
-                                Ok(Diverging::Value(MirRvalue::Use(operand)))
-                            }
-                        }
+                        // 关键重构：结构体/元组/数组这三条"无条件
+                        // 解构"路径，处理 arm.expr 之后要做的事逐字节
+                        // 相同——见 build_rvalue_expr_and_pop_scope 上面
+                        // 的说明，抽成一个方法，这里只是调用点。
+                        self.build_rvalue_expr_and_pop_scope(&arm.expr, shared)
                     }
 
                     // 对应 ast.rs 里新增的 Type::Tuple(Vec<Type>)。
@@ -1144,25 +1383,11 @@ impl MirBuilder {
                                 ));
                             }
                         }
-                        // 关键重构：这三条"无条件解构"路径（结构体/
-                        // 元组/数组）原来没有任何发散检查——它们不走
-                        // Switch/多分支，只是把 arm.expr 求值当作整个
-                        // match 表达式的值。现在 arm.expr 本身也可能发散
-                        // （比如唯一那条 arm 是 `Point { .. } => panic()`），
-                        // 见到 Diverged 原样传播；pop_scope 无论哪种情况
-                        // 都要执行（作用域配平，且往一个仍然可达的块里
-                        // 补几条 Drop 是无害的死代码，Rust 自己能容忍
-                        // 发散调用之后的不可达语句）。
-                        match self.build_expr(&arm.expr, shared)? {
-                            Diverging::Diverged => {
-                                self.pop_scope();
-                                Ok(Diverging::Diverged)
-                            }
-                            Diverging::Value(operand) => {
-                                self.pop_scope();
-                                Ok(Diverging::Value(MirRvalue::Use(operand)))
-                            }
-                        }
+                        // 关键重构：结构体/元组/数组这三条"无条件
+                        // 解构"路径，处理 arm.expr 之后要做的事逐字节
+                        // 相同——见 build_rvalue_expr_and_pop_scope 上面
+                        // 的说明，抽成一个方法，这里只是调用点。
+                        self.build_rvalue_expr_and_pop_scope(&arm.expr, shared)
                     }
                     Type::Array(elem_ty, _len) => {
                         if arms.len() != 1 {
@@ -1217,25 +1442,11 @@ impl MirBuilder {
                                 ));
                             }
                         }
-                        // 关键重构：这三条"无条件解构"路径（结构体/
-                        // 元组/数组）原来没有任何发散检查——它们不走
-                        // Switch/多分支，只是把 arm.expr 求值当作整个
-                        // match 表达式的值。现在 arm.expr 本身也可能发散
-                        // （比如唯一那条 arm 是 `Point { .. } => panic()`），
-                        // 见到 Diverged 原样传播；pop_scope 无论哪种情况
-                        // 都要执行（作用域配平，且往一个仍然可达的块里
-                        // 补几条 Drop 是无害的死代码，Rust 自己能容忍
-                        // 发散调用之后的不可达语句）。
-                        match self.build_expr(&arm.expr, shared)? {
-                            Diverging::Diverged => {
-                                self.pop_scope();
-                                Ok(Diverging::Diverged)
-                            }
-                            Diverging::Value(operand) => {
-                                self.pop_scope();
-                                Ok(Diverging::Value(MirRvalue::Use(operand)))
-                            }
-                        }
+                        // 关键重构：结构体/元组/数组这三条"无条件
+                        // 解构"路径，处理 arm.expr 之后要做的事逐字节
+                        // 相同——见 build_rvalue_expr_and_pop_scope 上面
+                        // 的说明，抽成一个方法，这里只是调用点。
+                        self.build_rvalue_expr_and_pop_scope(&arm.expr, shared)
                     }
 
                     // ---------- 枚举：原有逻辑，原样保留 ----------
@@ -1255,7 +1466,6 @@ impl MirBuilder {
                         });
 
                         let end_block = self.new_block();
-                        let dest_base = self.new_temp(expr.ty.clone());
                         let mut arm_infos: Vec<(usize, &HirExpr, Option<(String, String)>)> = Vec::new();
 
                         let mut targets = Vec::new();
@@ -1311,8 +1521,20 @@ impl MirBuilder {
                             default,
                         });
 
-                        // 4. 处理每个分支，记录每个分支产生的 SSA 版本
-                        let mut branch_results = Vec::new(); // (block_id, ssa_local)
+                        // 4. 处理每个分支，记录每个分支产生的值
+                        // 关键修复（dest_base 悬挂）：dest_base 原来在
+                        // 第 2 步之前就无条件 `new_temp` 创建好——如果
+                        // 所有分支都发散（比如每条 arm 都是
+                        // `=> panic()`），它永远不会被赋值，但已经登记
+                        // 进了 scope_vars，将来 pop_scope/
+                        // emit_drops_for_scopes 会照常给它插一条 Drop，
+                        // 对一个从未初始化的变量调用 drop()，编译不过。
+                        // 见 If 分支那处一模一样的问题和修法：先只收集
+                        // "哪些分支产生了值、产生在哪个块、值是什么"
+                        // （不创建 dest_base、不做任何 Assign），等循环
+                        // 结束、确认至少有一条分支真的有值之后，才创建
+                        // dest_base，回到各自记录的块里补 Assign。
+                        let mut value_arms: Vec<(usize, MirOperand)> = Vec::new();
 
                         for (block, arm_expr, binding_info) in arm_infos {
                             self.switch_to_block(block);
@@ -1361,48 +1583,84 @@ impl MirBuilder {
                             // 带出来的 Diverging 变体，发散那支下面什么
                             // 都不用做（终止器已经在更深处设成
                             // Unreachable，没有值可以送进 Phi），也不往
-                            // branch_results 里记。
-                            match self.build_expr(arm_expr, shared)? {
-                                Diverging::Diverged => {}
-                                Diverging::Value(operand) => {
-                                    let arm_ver = self.new_version(dest_base);
-                                    let arm_ssa = SsaLocal { base_id: dest_base, version: arm_ver };
-                                    self.push_stmt(MirStmt::Assign {
-                                        dest: MirPlace::Ssa(arm_ssa),
-                                        value: MirRvalue::Use(operand),
-                                    });
-                                    branch_results.push((block, arm_ssa));
-                                    if self.current_terminator_is_placeholder() {
+                            // value_arms 里记。
+                            //
+                            // 关键修复（? 跳过 pop_scope）：原来是
+                            // `match self.build_expr(arm_expr, shared)? {
+                            // ... }`——`?` 在 Err 分支直接把整个函数
+                            // return 掉，不会走到下面任何一支的
+                            // `self.pop_scope()`，这一层作用域（binding
+                            // 如果有的话）就永远不会被弹掉。跟前面几处
+                            // 一样，先存住结果，无论 Err/Diverged/Value
+                            // 都先 pop_scope，再决定下一步。
+                            let arm_result = self.build_expr(arm_expr, shared);
+                            match arm_result {
+                                Err(e) => {
+                                    self.pop_scope();
+                                    return Err(e);
+                                }
+                                Ok(Diverging::Diverged) => {
+                                    self.pop_scope();
+                                }
+                                Ok(Diverging::Value(operand)) => {
+                                    // 关键修复：跟 If 分支那处一样，
+                                    // arm_expr 内部如果自己还有嵌套的
+                                    // if/match/block，build_expr 求值完
+                                    // 之后 self.current_block 已经不是
+                                    // 这里的 block 了。真正该记进
+                                    // value_arms（进而记进 Phi 来源）的，
+                                    // 是这个"最终块"，不是循环变量
+                                    // 里最初 switch_to_block 进去的
+                                    // block。
+                                    let final_block = self.current_block;
+                                    self.pop_scope();
+                                    if self.current_block_terminator_is_unset() {
                                         self.set_terminator(MirTerminator::Goto(end_block));
                                     }
+                                    value_arms.push((final_block, operand));
                                 }
                             }
-                            self.pop_scope();
                         }
 
-                        // 5. 切换到 end_block，插入 Phi
+                        // 5. 切换到 end_block
                         self.switch_to_block(end_block);
-                        if branch_results.is_empty() {
+                        if value_arms.is_empty() {
                             // 关键修复：原来是 unreachable!()——对
                             // "每个分支都以 panic 结尾"这种合法用户代码
-                            // 会让编译器自己崩溃。branch_results 为空
-                            // 恰好就说明所有分支都发散了，那么整个 match
-                            // 表达式也是发散的，原样传播，不再自己 panic。
-                            Ok(Diverging::Diverged)
-                        } else {
-                            let phi_values: Vec<(usize, MirOperand)> = branch_results
-                                .into_iter()
-                                .map(|(block, ssa)| (block, MirOperand::Move(MirPlace::Ssa(ssa))))
-                                .collect();
-
-                            let phi_ver = self.new_version(dest_base);
-                            let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
-                            self.push_stmt(MirStmt::Assign {
-                                dest: MirPlace::Ssa(phi_ssa),
-                                value: MirRvalue::Phi { values: phi_values },
-                            });
-                            Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
+                            // 会让编译器自己崩溃。value_arms 为空恰好就
+                            // 说明所有分支都发散了，那么整个 match
+                            // 表达式也是发散的，原样传播，不再自己
+                            // panic，也不创建 dest_base（见上面的说明）。
+                            return Ok(Diverging::Diverged);
                         }
+
+                        // 走到这里，至少有一条分支产生了值，现在才创建
+                        // dest_base，回到每条产生值的分支记录的块里补上
+                        // Assign——那时候这些块的终止器已经设成了
+                        // Goto(end_block)，往它们的语句列表末尾（终止器
+                        // 之前）追加一条 Assign 完全合法，语义上就是
+                        // "赋值发生在跳转之前"，顺序是对的。
+                        let dest_base = self.new_temp(expr.ty.clone());
+                        let mut phi_values = Vec::new();
+                        for (block, operand) in value_arms {
+                            self.switch_to_block(block);
+                            let arm_ver = self.new_version(dest_base);
+                            let arm_ssa = SsaLocal { base_id: dest_base, version: arm_ver };
+                            self.push_stmt(MirStmt::Assign {
+                                dest: MirPlace::Ssa(arm_ssa),
+                                value: MirRvalue::Use(operand),
+                            });
+                            phi_values.push((block, MirOperand::Move(MirPlace::Ssa(arm_ssa))));
+                        }
+
+                        self.switch_to_block(end_block);
+                        let phi_ver = self.new_version(dest_base);
+                        let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
+                        self.push_stmt(MirStmt::Assign {
+                            dest: MirPlace::Ssa(phi_ssa),
+                            value: MirRvalue::Phi { values: phi_values },
+                        });
+                        Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
                     }
 
                     // ---------- 整数/布尔/字符：标量字面量，复用 Switch ----------
@@ -1424,7 +1682,6 @@ impl MirBuilder {
                         let discr = MirOperand::Copy(MirPlace::Ssa(self.current_ssa(cond_temp)));
 
                         let end_block = self.new_block();
-                        let dest_base = self.new_temp(expr.ty.clone());
 
                         let mut targets = Vec::new();
                         let mut default_block = None;
@@ -1498,50 +1755,68 @@ impl MirBuilder {
                             default,
                         });
 
-                        // 4. 处理每个分支，记录 SSA 版本
-                        let mut branch_results = Vec::new();
+                        // 4. 处理每个分支
+                        // 关键修复（dest_base 悬挂，同枚举 match 那处）：
+                        // 先只收集"哪些分支产生了值、产生在哪个块、值是
+                        // 什么"，不提前创建 dest_base，等确认至少一条
+                        // 分支真的有值之后再创建、再回去补 Assign。
+                        let mut value_arms: Vec<(usize, MirOperand)> = Vec::new();
 
                         for (block, arm_expr) in arm_infos {
                             self.switch_to_block(block);
                             // 关键重构（Type::Never 去特判化）：跟枚举
                             // match 那处同一个道理，直接看 Diverging。
+                            // 这里没有 push_scope/pop_scope（标量字面量
+                            // 模式不引入绑定），`?` 直接传播错误不会漏掉
+                            // 任何清理工作，不用像枚举 match 那样拆开
+                            // 处理 Err。
                             match self.build_expr(arm_expr, shared)? {
                                 Diverging::Diverged => {}
                                 Diverging::Value(operand) => {
-                                    let arm_ver = self.new_version(dest_base);
-                                    let arm_ssa = SsaLocal { base_id: dest_base, version: arm_ver };
-                                    self.push_stmt(MirStmt::Assign {
-                                        dest: MirPlace::Ssa(arm_ssa),
-                                        value: MirRvalue::Use(operand),
-                                    });
-                                    branch_results.push((block, arm_ssa));
-                                    if self.current_terminator_is_placeholder() {
+                                    // 关键修复：跟枚举 match/If 分支同一个
+                                    // 问题——arm_expr 内部如果自己还有
+                                    // 嵌套控制流，求值完之后
+                                    // self.current_block 已经不是这里的
+                                    // block 了，真正该记的是这个"最终块"。
+                                    let final_block = self.current_block;
+                                    if self.current_block_terminator_is_unset() {
                                         self.set_terminator(MirTerminator::Goto(end_block));
                                     }
+                                    value_arms.push((final_block, operand));
                                 }
                             }
                         }
 
                         // 5. End block：Phi
                         self.switch_to_block(end_block);
-                        if branch_results.is_empty() {
+                        if value_arms.is_empty() {
                             // 关键修复：同枚举 match 那处，原来是
-                            // unreachable!()，现在如实传播 Diverged。
-                            Ok(Diverging::Diverged)
-                        } else {
-                            let phi_values: Vec<(usize, MirOperand)> = branch_results
-                                .into_iter()
-                                .map(|(block, ssa)| (block, MirOperand::Move(MirPlace::Ssa(ssa))))
-                                .collect();
-
-                            let phi_ver = self.new_version(dest_base);
-                            let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
-                            self.push_stmt(MirStmt::Assign {
-                                dest: MirPlace::Ssa(phi_ssa),
-                                value: MirRvalue::Phi { values: phi_values },
-                            });
-                            Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
+                            // unreachable!()，现在如实传播 Diverged，
+                            // 也不创建 dest_base。
+                            return Ok(Diverging::Diverged);
                         }
+
+                        let dest_base = self.new_temp(expr.ty.clone());
+                        let mut phi_values = Vec::new();
+                        for (block, operand) in value_arms {
+                            self.switch_to_block(block);
+                            let arm_ver = self.new_version(dest_base);
+                            let arm_ssa = SsaLocal { base_id: dest_base, version: arm_ver };
+                            self.push_stmt(MirStmt::Assign {
+                                dest: MirPlace::Ssa(arm_ssa),
+                                value: MirRvalue::Use(operand),
+                            });
+                            phi_values.push((block, MirOperand::Move(MirPlace::Ssa(arm_ssa))));
+                        }
+
+                        self.switch_to_block(end_block);
+                        let phi_ver = self.new_version(dest_base);
+                        let phi_ssa = SsaLocal { base_id: dest_base, version: phi_ver };
+                        self.push_stmt(MirStmt::Assign {
+                            dest: MirPlace::Ssa(phi_ssa),
+                            value: MirRvalue::Phi { values: phi_values },
+                        });
+                        Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(MirPlace::Ssa(phi_ssa)))))
                     }
                 }
             }
@@ -1573,6 +1848,228 @@ impl MirBuilder {
         match arg {
             HirCallArg::Positional(e) => self.build_expr(e, shared),
             HirCallArg::Named(_, e) => self.build_expr(e, shared),
+        }
+    }
+
+    // 关键重构：build_expr_rvalue 里处理 Match 时，结构体/元组/数组
+    // 这三种"模式无条件解构成功、不需要 Switch/多分支"的路径，各自
+    // 求值完 arm.expr 之后要做的事逐字节相同——不管 arm.expr 发不发散
+    // 都要 pop_scope（进这个分支之前，各自的调用点都为模式绑定的变量
+    // push_scope 过一次，这里得配对弹出去），然后把结果包成
+    // `Result<RvalueResult, String>` 交回去。三处重复的代码抽成这一个
+    // 方法，调用点只剩一行。
+    fn build_rvalue_expr_and_pop_scope(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<RvalueResult, String> {
+        // 关键修复：原来是 `match self.build_expr(expr, shared)? { ... }`
+        // ——`?` 在 Err 分支直接把 Err(String) 从这个函数整个 return
+        // 出去，根本没走到下面两条分支里的 `self.pop_scope()`。这个
+        // helper 存在的唯一理由就是"pop_scope 不管求值成功还是发散都
+        // 必须执行"，结果这份职责本身在抽出来的实现里被 `?` 绕过去了——
+        // 抽象完了但没把被抽象掉的问题一起修掉，比不抽更糟：调用点看到
+        // 一个专门叫这个名字的函数，会理所当然地以为这件事已经处理好了。
+        // 现在把 `build_expr` 的结果先存起来（不提前用 `?` 短路），无
+        // 论如何都先 pop_scope，再对存好的结果做 `?`/match。
+        let result = self.build_expr(expr, shared);
+        self.pop_scope();
+        match result? {
+            Diverging::Diverged => Ok(Diverging::Diverged),
+            Diverging::Value(operand) => Ok(Diverging::Value(MirRvalue::Use(operand))),
+        }
+    }
+
+    // ===== 循环头 Phi =====
+    //
+    // 背景：MirBuilder 的 SSA 是直线代码版——同一个 base_id 每被
+    // Assign 一次就 new_version，current_ssa(base_id) 返回"最后一次
+    // 赋值对应的版本"。这在顺序执行的代码里没问题，但循环有一条
+    // "回边"（body 执行完跳回循环头），循环第二轮开始时，循环头里读到
+    // 的 base_id 应该是"上一轮循环体结束时的值"，不是"进入循环之前的
+    // 值"——直线 SSA 表达不出"这个值取决于我们是第一次到这里、还是
+    // 绕了一圈回来的"这种二义性，必须在循环头显式插入 Phi 节点。这也
+    // 是为支配树、GVN、SCCP（稀疏条件常量传播）、聚合常量折叠这些后续
+    // 分析做准备——它们都要求输入是规范的 SSA 形式。
+
+    // 预扫描循环体，找出被 Assign 语句直接修改过的变量名——这些变量
+    // 才需要在循环头插 Phi；从未在循环体内被修改的变量，循环体每一轮
+    // 读到的都是循环外的同一个值，不存在"这一轮该读哪个版本"的二义性，
+    // 不需要 Phi。
+    fn collect_modified_vars_block(block: &HirBlock, out: &mut HashSet<String>) {
+        for stmt in &block.stmts {
+            Self::collect_modified_vars_stmt(stmt, out);
+        }
+    }
+
+    fn collect_modified_vars_stmt(stmt: &HirStmt, out: &mut HashSet<String>) {
+        match stmt {
+            HirStmt::Assign { target, .. } => {
+                // 只认 Ident 目标——Field/Index 目标现在 mir_builder 不
+                // 递增 SSA 版本（见 HirStmt::Assign 分支：只有目标是
+                // MirPlace::Ssa 时才 new_version，Field/Index 保留原样），
+                // 它们不参与循环 Phi，这跟当前 SSA 的粒度保持一致。
+                if let HirExprKind::Ident(name) = &target.kind {
+                    out.insert(name.clone());
+                }
+            }
+            HirStmt::Let { .. } => {
+                // let 引入新局部变量，不修改外层已有的，不算。
+            }
+            HirStmt::While { cond, body, .. } => {
+                Self::collect_modified_vars_expr(cond, out);
+                Self::collect_modified_vars_block(body, out);
+            }
+            // 关键：递归进所有子块，包括嵌套循环体。内层循环里对 i 的
+            // 赋值同样会改变外层循环下一次迭代看到的 i，外层循环头也
+            // 需要给 i 建 Phi。
+            HirStmt::Loop { body, .. } => {
+                Self::collect_modified_vars_block(body, out);
+            }
+            HirStmt::For { body, .. } => {
+                // 正常情况下不会走到这里——elaborate.rs 在 MIR 构建之前
+                // 已经把 for 展开成 loop + match（build_stmt 里
+                // HirStmt::For 分支同样的说明）。真出现说明流水线顺序
+                // 有问题，但递归进去本身没有坏处，不特殊处理、不报错，
+                // 跟 build_stmt 那边"防御性报错"的取舍不同——这里只是
+                // 收集信息，不是真正构建 MIR，没有必要在这个信息收集
+                // 阶段就终止整个编译。
+                Self::collect_modified_vars_block(body, out);
+            }
+            HirStmt::UnsafeBlock { body, .. } => {
+                Self::collect_modified_vars_block(body, out);
+            }
+            HirStmt::Break { .. } => {}
+            HirStmt::Return { expr, .. } => {
+                if let Some(e) = expr {
+                    Self::collect_modified_vars_expr(e, out);
+                }
+            }
+            HirStmt::Expr { expr, .. } => {
+                Self::collect_modified_vars_expr(expr, out);
+            }
+        }
+    }
+
+    // 这门语言里 if/match/block 都是表达式，不是独立的语句节点
+    // （`if`作为语句出现时，落在 HirStmt::Expr 里包着一个
+    // HirExprKind::If），所以"循环体里有没有条件赋值"这件事，得从
+    // HirStmt::Expr 往下钻进表达式树，找出其中可能包着 HirBlock（也就
+    // 可能包着 Assign 语句）的那几种：Block/UnsafeBlock 直接包一个
+    // HirBlock；If 的 then/else 分支、Match 的每个 arm 是 HirExpr，
+    // 但通常又是 HirExprKind::Block(...)，一路递归下去自然会展开到
+    // 真正的 HirBlock。
+    //
+    // 覆盖范围说明：这里只递归 If/Match/Block/UnsafeBlock 这几种
+    // "长得像控制流"的位置，没有递归 BinaryOp/Call 参数/StructInit
+    // 字段这些位置——理论上 `1 + { x = 5; x }` 这种把赋值藏进算术
+    // 子表达式的写法也能把一个 HirBlock 嵌进任意表达式位置，但这在
+    // 实际代码里极其罕见，穷举所有表达式位置递归下去要把这个函数
+    // 变成一整套通用 HIR walker，性价比很低。已知的不完整之处，
+    // 先记在这里。
+    fn collect_modified_vars_expr(expr: &HirExpr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            HirExprKind::Block(block) => {
+                Self::collect_modified_vars_block(block, out);
+            }
+            HirExprKind::UnsafeBlock { body, .. } => {
+                Self::collect_modified_vars_block(body, out);
+            }
+            HirExprKind::If { kind: _, cond, then_expr, else_expr } => {
+                Self::collect_modified_vars_expr(cond, out);
+                Self::collect_modified_vars_expr(then_expr, out);
+                if let Some(e) = else_expr {
+                    Self::collect_modified_vars_expr(e, out);
+                }
+            }
+            HirExprKind::Match { cond, arms } => {
+                Self::collect_modified_vars_expr(cond, out);
+                for arm in arms {
+                    Self::collect_modified_vars_expr(&arm.expr, out);
+                }
+            }
+            // 其余表达式种类本身不可能直接携带 HirStmt（它们的子节点
+            // 要么是别的表达式，要么是纯数据如字符串/类型），因此不
+            // 可能包含 Assign 语句，不需要递归。穷尽列出，不用 `_`
+            // 兜底——新增一种 HirExprKind 变体时，这里会因为
+            // "non-exhaustive match" 编译不过，逼着回来决定它要不要
+            // 参与这份扫描，而不是被通配符悄悄吞掉。
+            HirExprKind::Literal(_)
+            | HirExprKind::Ident(_)
+            | HirExprKind::Sym(_)
+            | HirExprKind::BinaryOp { .. }
+            | HirExprKind::Unary { .. }
+            | HirExprKind::Cast { .. }
+            | HirExprKind::FieldAccess { .. }
+            | HirExprKind::Index { .. }
+            | HirExprKind::Call { .. }
+            | HirExprKind::EnumVariantConstruction { .. }
+            | HirExprKind::EnumVariantAccess { .. }
+            | HirExprKind::StructInit { .. }
+            | HirExprKind::ArrayLiteral(_)
+            | HirExprKind::LackSlice(_)
+            | HirExprKind::Closure { .. }
+            | HirExprKind::Range { .. } => {}
+        }
+    }
+
+    /// 在当前块（循环头）最前面插入一组 Phi。
+    /// `preheader_block` 是进入循环之前所在的那个块——Phi 的第一个
+    /// incoming。调用时机很重要：必须在循环头块（cond_block 或
+    /// While 没有独立 cond_block 时的 body_block）刚 switch_to_block
+    /// 进去、还没塞任何语句的时候调用——插入的 Phi 语句直接 push 到
+    /// 块尾，此时块尾就是块头。
+    fn insert_loop_header_phis(
+        &mut self,
+        preheader_block: usize,
+        body: &HirBlock,
+    ) -> Vec<LoopPhiInfo> {
+        let mut modified_names: HashSet<String> = HashSet::new();
+        Self::collect_modified_vars_block(body, &mut modified_names);
+
+        let header_block = self.current_block;
+        let mut phis = Vec::new();
+
+        for name in &modified_names {
+            let Some(base_id) = self.lookup(name) else { continue };
+            let entry_ssa = self.current_ssa(base_id); // 进入循环前的版本
+            let phi_version = self.new_version(base_id); // 分配新版本——
+            // 之后循环体内部读 base_id，current_ssa 会返回这个新版本，
+            // 也就是 phi_ssa，这正是我们想要的：循环体内的读取，不管
+            // 是第一轮还是绕回来的后续轮次，统一读这一个 Phi 汇合出来
+            // 的值。
+            let phi_ssa = SsaLocal { base_id, version: phi_version };
+
+            let stmt_index = self.blocks[header_block].stmts.len();
+            // 直接 push 会加到末尾；既然现在 header_block 里除了 Phi
+            // 还没别的语句（求值 cond 的语句在下面才 push，Loop 分支
+            // 循环体自己的语句也还没开始构建），push 即等价于放到
+            // 开头。多个 Phi 之间顺序无关。
+            self.push_stmt(MirStmt::Assign {
+                dest: MirPlace::Ssa(phi_ssa),
+                value: MirRvalue::Phi {
+                    values: vec![
+                        (preheader_block, MirOperand::Move(MirPlace::Ssa(entry_ssa))),
+                        // 第二个 incoming（回边）暂时留空，等循环体
+                        // 构建完，由 finalize_loop_header_phis 回填。
+                    ],
+                },
+            });
+
+            phis.push(LoopPhiInfo { header_block, stmt_index, base_id });
+        }
+        phis
+    }
+
+    /// 循环体构建完后，回填每条 Phi 的第二个 incoming（回边）。只有
+    /// 循环体真的会绕回循环头时才调用这个函数（调用点：While/Loop
+    /// 分支里，只在 body 正常掉出尾部、且尾部所在块此刻还没有真终止器
+    /// 时才调用——没有回边就不存在第二个 incoming，Phi 保持单路，交给
+    /// control::simplify 的 simplify_phi 折叠回普通 Use）。
+    fn finalize_loop_header_phis(&mut self, phis: &[LoopPhiInfo], back_edge_block: usize) {
+        for info in phis {
+            let back_ssa = self.current_ssa(info.base_id);
+            if let MirStmt::Assign { value: MirRvalue::Phi { values }, .. }
+                = &mut self.blocks[info.header_block].stmts[info.stmt_index]
+            {
+                values.push((back_edge_block, MirOperand::Move(MirPlace::Ssa(back_ssa))));
+            }
         }
     }
 }

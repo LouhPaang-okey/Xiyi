@@ -384,10 +384,13 @@ impl Simplify {
                 }
                 op.clone()
             }
-            // 非 Ssa 的 place（Local/Field/Index/Deref/Static/
-            // EnumPayload）不在这两张表的追踪范围内，原样返回——理由
-            // 见 fold_block 顶部的说明。
-            MirOperand::Copy(_) | MirOperand::Move(_) | MirOperand::Constant(_) => op.clone(),
+            // 非 Ssa 的 place（Field/Index/Deref/EnumPayload）不在这两张
+            // 表的追踪范围内，原样返回——理由见 fold_block 顶部的说明。
+            // Sym/Static 同样原样返回：它们是 mir.rs 这一轮从 MirPlace
+            // 搬到 MirOperand 的两个变体，不指向任何局部变量，根本不
+            // 可能出现在 const_map/copy_map 里，没有什么可折叠的。
+            MirOperand::Copy(_) | MirOperand::Move(_) | MirOperand::Constant(_)
+            | MirOperand::Sym(_) | MirOperand::Static(_) => op.clone(),
         }
     }
 
@@ -714,6 +717,14 @@ impl Simplify {
     // used_ssa / used_local 两个集合，读写两侧统一按这两个集合走。
     fn eliminate_dead_stores(body: &mut MirBody) {
         let mut used_ssa: HashSet<SsaLocal> = HashSet::new();
+        // 关键说明（找回被之前那处删掉的解释）：MirPlace 现在只有
+        // Ssa/Field/Index/Deref/EnumPayload 五种，全部递归到底都落在
+        // Ssa 上——没有任何 MirPlace 变体会往 used_local 里塞东西（见
+        // 下面 collect_used_vars_in_place 的实现），这张表因此永远是
+        // 空的。保留它的类型/参数没有删，是为了不去动
+        // eliminate_dead_stores 整条调用链的函数签名（影响面更大），
+        // 只做编译能过所必需的最小改动；真要彻底清理，需要把
+        // used_local 从这一整条调用链里都摘掉，这次先不做。
         let mut used_local: HashSet<usize> = HashSet::new();
 
         for block in &body.blocks {
@@ -734,7 +745,7 @@ impl Simplify {
                         // 现在所有赋值目标要么是 Ssa，要么是下面这几种
                         // 复合 place，不会再有裸的 Local 出现，直接删掉
                         // 这一支即可，不需要另找地方安放。
-                        // Field/Index/Deref/Static/EnumPayload：写的是
+                        // Field/Index/Deref/EnumPayload：写的是
                         // 内存里某个更复杂的位置（结构体字段、数组
                         // 元素……），这个简化版分析不追踪"这个具体位置
                         // 有没有被读到"（可能被另一条路径别名读取），
@@ -763,9 +774,12 @@ impl Simplify {
                 // base，那个 base 是被读到的，要算作使用——不然"这个
                 // base 是哪条赋值产生的"会被当成死赋值误删。
                 match dest {
-                    // 关键修复：同上，Local 已经不存在了，删掉这个分支
-                    // 里的 Local 分支，Ssa/Static 不需要往下递归。
-                    MirPlace::Ssa(_) | MirPlace::Static(_) => {}
+                    // 关键修复：Local 已经不存在了，Ssa 不需要往下递归——
+                    // Sym/Static 现在也不可能出现在这里了（它们从
+                    // MirPlace 挪去了 MirOperand，见 mir.rs 里那条搬家
+                    // 说明），MirPlace 只剩 Ssa/Field/Index/Deref/
+                    // EnumPayload 五种，这个 match 天然穷尽。
+                    MirPlace::Ssa(_) => {}
                     MirPlace::Field { base, .. }
                     | MirPlace::Deref(base)
                     | MirPlace::EnumPayload { base, .. } => {
@@ -857,6 +871,11 @@ impl Simplify {
                 Self::collect_used_vars_in_place(place, used_ssa, used_local);
             }
             MirOperand::Constant(_) => {}
+            // 关键修复（Sym/Static 搬家）：这两个变体从 MirPlace 挪来
+            // MirOperand 之后，不指向任何局部变量，不产生 used_ssa/
+            // used_local 记录，跟 Constant 是同一个道理。
+            MirOperand::Sym(_) => {}
+            MirOperand::Static(_) => {}
         }
     }
 
@@ -866,22 +885,20 @@ impl Simplify {
     // eliminate_dead_stores 之前完全不可用的核心原因之一：现在几乎
     // 所有读取都是 Copy/Move(Ssa(..))，一个只认 Local 的收集函数
     // 等于什么都收集不到。
+    //
+    // 关键修复（Sym/Static 搬家）：MirPlace::Static 已经不存在了——
+    // mir.rs 把它挪去了 MirOperand（见那边的说明），MirPlace 现在只剩
+    // Ssa/Field/Index/Deref/EnumPayload 五种，这个 match 天然穷尽，
+    // 不再需要给 Static 单写一条"什么都不做"的分支。
     fn collect_used_vars_in_place(
         place: &MirPlace,
         used_ssa: &mut HashSet<SsaLocal>,
         used_local: &mut HashSet<usize>,
     ) {
         match place {
-            // 关键修复：`MirPlace::Local` 已经不存在了，删掉这一支。
-            // `used_local` 这个集合因此永远不会再被写入，成了个恒空的
-            // 死重——保留它的类型/参数没有删，是为了不去动
-            // eliminate_dead_stores 整条调用链的函数签名（影响面更大），
-            // 只做编译能过所必需的最小改动；真要彻底清理，需要把
-            // used_local 从这一整条调用链里都摘掉，这次先不做。
             MirPlace::Ssa(ssa) => {
                 used_ssa.insert(*ssa);
             }
-            MirPlace::Static(_) => {}
             MirPlace::Field { base, .. } => {
                 Self::collect_used_vars_in_place(base, used_ssa, used_local);
             }
@@ -913,7 +930,12 @@ impl Simplify {
             MirTerminator::Return(Some(op)) => {
                 Self::collect_used_vars_in_operand(op, used_ssa, used_local)
             }
-            MirTerminator::Return(None) | MirTerminator::Goto(_) | MirTerminator::Unreachable => {}
+            // 关键修复（Placeholder/Unreachable 拆分）：mir.rs 新增的
+            // Placeholder 没有任何操作数（它就表示"这个块的终止器还没
+            // 设置"），跟 Return(None)/Goto/Unreachable 落进同一支，
+            // 不产生任何"用到了谁"的记录。
+            MirTerminator::Return(None) | MirTerminator::Goto(_) | MirTerminator::Unreachable
+            | MirTerminator::Placeholder => {}
         }
     }
 
