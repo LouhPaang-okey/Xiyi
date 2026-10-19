@@ -7,159 +7,250 @@ pub struct Monomorphic;
 
 impl Monomorphic {
     pub fn run(mut program: MirProgram) -> MirProgram {
-        let all_fns = program.fns;
-        let mut new_fns = Vec::new();
-        let mut used_fn_names = HashSet::new();
-        let mut call_sites = Vec::new();
+        let all_fns = program.fns.clone();
+        let all_structs = program.structs.clone();
+        let all_enums = program.enums.clone();
 
-        // 关键修复：原来 struct 实例是收集进
-        // `HashMap<String, Vec<Type>>`——同一个泛型结构体名字只能存一份
-        // 类型实参，如果程序里同时用到 `Point<i32>` 和 `Point<String>`，
-        // 后收集到的会直接覆盖掉先收集到的，只有一个会被真正生成，
-        // 另一个悄悄丢失。这跟 `call_sites`（函数那边）的做法不一致——
-        // 函数那边一直是 `Vec<(String, Vec<Type>)>`，同一个名字的多次
-        // 不同实例化都能各自留一条记录，靠后面按"单态化之后的名字"
-        // （比如 `identity_i32`）去重，而不是靠原始名字去重。这里改成
-        // 同样的 Vec 形式，struct 和 enum 都是。
+        let mut new_fns = Vec::new();
+        let mut generated_fn_names = HashSet::new();
+        let mut call_sites = Vec::new();
         let mut struct_instances: Vec<(String, Vec<Type>)> = Vec::new();
         let mut enum_instances: Vec<(String, Vec<Type>)> = Vec::new();
 
-        // 初始收集所有函数的调用 + 泛型结构体/枚举实例
+        // 先从所有 MIR 类型位置和构造点收集实例。不能只看 StructInit /
+        // EnumVariantConstruction，否则“只出现在字段/参数/返回值里的泛型类型”
+        // 会漏掉。
         for f in &all_fns {
             Self::collect_calls(&f.body, &mut call_sites);
+            for (_, ty) in &f.params {
+                Self::collect_generic_types(ty, &mut struct_instances, &mut enum_instances);
+            }
+            if let Some(ty) = &f.return_type {
+                Self::collect_generic_types(ty, &mut struct_instances, &mut enum_instances);
+            }
+            for local in &f.body.locals {
+                Self::collect_generic_types(&local.ty, &mut struct_instances, &mut enum_instances);
+            }
             Self::collect_generic_instances(&f.body, &mut struct_instances, &mut enum_instances);
         }
 
-        // 循环直到没有新的调用需要处理
-        while !call_sites.is_empty() {
-            let mut new_call_sites = Vec::new();
-            for (func_name, generic_args) in call_sites.drain(..) {
-                if let Some(base_fn) = all_fns.iter().find(|f| f.name == func_name) {
-                    if base_fn.generic_params.is_empty() {
-                        continue;
-                    }
-                    let mut subst = HashMap::new();
-                    for (param, concrete) in base_fn.generic_params.iter().zip(generic_args.iter()) {
-                        subst.insert(param.name.clone(), concrete.clone());
-                    }
-                    let mut cloned = base_fn.clone();
-                    let mangled = Self::mangled_name(&base_fn.name, &generic_args);
-                    cloned.name = mangled.clone();
-                    cloned.generic_params.clear();
-                    cloned.params = cloned.params
-                        .into_iter()
-                        .map(|(name, ty)| (name, Self::replace_type(&ty, &subst)))
-                        .collect();
-                    cloned.return_type = cloned.return_type.map(|ty| Self::replace_type(&ty, &subst));
-                    cloned.body = Self::replace_body(&cloned.body, &subst);
+        // 函数单态化工作队列：处理一个实例后，再扫描它的具体函数体，
+        // 发现新的具体泛型调用，直到队列耗尽。
+        //
+        // call_sites 只增不减。generated_fn_names.insert(mangled) 能挡住
+        // "同一个 mangled 名字被重复生成"，但挡不住不同 mangled 名字之间
+        // 的无限链——例如一个泛型函数在体内递归调用自己并且每次都把类型
+        // 参数包一层（T -> Wrapper<T> -> Wrapper<Wrapper<T>> -> ...），
+        // 每次产生的 mangled 名字都是新的，永远不会被 generated_fn_names
+        // 挡住，队列会无限增长。这在源语言层面是非法的（违反
+        // "单态化后代码规模必须有限"这条前提），但不能指望前面的阶段一定
+        // 已经拒绝掉它；这里必须有自己的硬上限，超限就报错退出，而不是
+        // 让编译器无限跑下去。
+        const MAX_MONOMORPHIZATION_ITERATIONS: usize = 100_000;
 
-                    if !used_fn_names.contains(&mangled) {
-                        Self::collect_calls(&cloned.body, &mut new_call_sites);
-                        // 关键修复：新生成的这份函数体是把 T 换成具体
-                        // 类型之后的版本，它内部对泛型结构体/枚举的
-                        // 实例化（比如 `fn wrap<T>(x: T) -> Box<T> { Box
-                        // { value: x } }` 里的 `Box { value: x }`，T 换成
-                        // i32 之后就是 `Box<i32>` 的一次实例化）只有在
-                        // 替换完之后才看得出具体是哪个类型——原来这里
-                        // 没有对 cloned.body 重新收集一次，这类"藏在
-                        // 泛型函数体里、只有单态化之后才能确定具体类型"
-                        // 的结构体/枚举实例化会被完全漏掉。
-                        Self::collect_generic_instances(&cloned.body, &mut struct_instances, &mut enum_instances);
-                        new_fns.push(cloned);
-                        used_fn_names.insert(mangled);
-                    }
-                }
+        let mut call_index = 0;
+        while call_index < call_sites.len() {
+            if call_index >= MAX_MONOMORPHIZATION_ITERATIONS {
+                panic!(
+                    "monomorphization error: exceeded {} iterations while expanding generic function calls; \
+                     this usually means unbounded generic recursion (e.g. a generic function that calls itself \
+                     with an ever-growing type argument)",
+                    MAX_MONOMORPHIZATION_ITERATIONS
+                );
             }
-            call_sites = new_call_sites;
+
+            let (func_name, generic_args) = call_sites[call_index].clone();
+            call_index += 1;
+
+            // 泛型模板中的调用可能仍然含有外层 TypeParam；这种调用不能
+            // 在这里提前实例化，等外层函数本身被具体化后再重新收集。
+            if Self::contains_unresolved_type(&generic_args) {
+                continue;
+            }
+
+            let Some(base_fn) = all_fns.iter().find(|f| f.name == func_name) else {
+                continue;
+            };
+
+            if base_fn.generic_params.is_empty() {
+                panic!(
+                    "monomorphization error: function `{}` received {} generic arguments, but is not generic",
+                    func_name,
+                    generic_args.len()
+                );
+            }
+            if base_fn.generic_params.len() != generic_args.len() {
+                panic!(
+                    "monomorphization error: generic arity mismatch for `{}`: expected {}, got {}",
+                    func_name,
+                    base_fn.generic_params.len(),
+                    generic_args.len()
+                );
+            }
+
+            let mangled = Self::mangled_name(&base_fn.name, &generic_args);
+            if !generated_fn_names.insert(mangled.clone()) {
+                continue;
+            }
+
+            let subst: HashMap<String, Type> = base_fn
+                .generic_params
+                .iter()
+                .zip(generic_args.iter())
+                .map(|(param, concrete)| (param.name.clone(), concrete.clone()))
+                .collect();
+            let mut cloned = base_fn.clone();
+            cloned.name = mangled;
+            cloned.generic_params.clear();
+            cloned.params = cloned
+                .params
+                .into_iter()
+                .map(|(name, ty)| (name, Self::replace_type(&ty, &subst)))
+                .collect();
+            cloned.return_type = cloned.return_type.map(|ty| Self::replace_type(&ty, &subst));
+            cloned.body = Self::replace_body(&cloned.body, &subst);
+
+            Self::assert_no_unresolved_types_in_fn(&cloned, "function monomorphization");
+
+            Self::collect_calls(&cloned.body, &mut call_sites);
+            Self::collect_generic_instances(&cloned.body, &mut struct_instances, &mut enum_instances);
+            for (_, ty) in &cloned.params {
+                Self::collect_generic_types(ty, &mut struct_instances, &mut enum_instances);
+            }
+            if let Some(ty) = &cloned.return_type {
+                Self::collect_generic_types(ty, &mut struct_instances, &mut enum_instances);
+            }
+            for local in &cloned.body.locals {
+                Self::collect_generic_types(&local.ty, &mut struct_instances, &mut enum_instances);
+            }
+            new_fns.push(cloned);
         }
 
-        // 3. 生成具体结构体
-        // 关键修复：原来遍历的是 `used_struct_instances: HashMap<...>`，
-        // 一个名字只有一份类型实参；现在遍历 Vec，同一个结构体的多次
-        // 不同实例化都会各自走一遍，靠 `generated_struct_names`（存的
-        // 是单态化之后的名字，如 `Point_i32`）去重，避免同一个具体
-        // 实例被重复生成。
+        // 结构体和枚举使用同一个工作队列思想：实例化一个具体类型后，
+        // 继续扫描其字段/变体，直到没有新的具体泛型类型出现。
+        let mut struct_index = 0;
+        let mut enum_index = 0;
+        let mut generated_struct_names = HashSet::new();
+        let mut generated_enum_names = HashSet::new();
         let mut new_structs = Vec::new();
-        let mut generated_struct_names: HashSet<String> = HashSet::new();
-        for (struct_name, type_args) in &struct_instances {
-            if let Some(base_struct) = program.structs.iter().find(|s| &s.name == struct_name) {
+        let mut new_enums = Vec::new();
+
+        loop {
+            let mut progressed = false;
+
+            while struct_index < struct_instances.len() {
+                let (struct_name, type_args) = struct_instances[struct_index].clone();
+                struct_index += 1;
+                if Self::contains_unresolved_type(&type_args) {
+                    continue;
+                }
+
+                let Some(base_struct) = all_structs.iter().find(|s| s.name == struct_name) else {
+                    continue;
+                };
                 if base_struct.generic_params.is_empty() {
                     continue;
                 }
-                let mangled = Self::mangled_name(&base_struct.name, type_args);
-                if generated_struct_names.contains(&mangled) {
+                if base_struct.generic_params.len() != type_args.len() {
+                    panic!(
+                        "monomorphization error: generic arity mismatch for struct `{}`: expected {}, got {}",
+                        struct_name,
+                        base_struct.generic_params.len(),
+                        type_args.len()
+                    );
+                }
+
+                let mangled = Self::mangled_name(&base_struct.name, &type_args);
+                if !generated_struct_names.insert(mangled.clone()) {
                     continue;
                 }
-                let mut subst = HashMap::new();
-                for (param, concrete) in base_struct.generic_params.iter().zip(type_args.iter()) {
-                    subst.insert(param.name.clone(), concrete.clone());
-                }
+
+                let subst: HashMap<String, Type> = base_struct
+                    .generic_params
+                    .iter()
+                    .zip(type_args.iter())
+                    .map(|(param, concrete)| (param.name.clone(), concrete.clone()))
+                    .collect();
                 let mut cloned = base_struct.clone();
-                cloned.name = mangled.clone();
+                cloned.name = mangled;
                 cloned.generic_params.clear();
-                cloned.fields = cloned.fields
+                cloned.fields = cloned
+                    .fields
                     .into_iter()
                     .map(|(name, ty)| (name, Self::replace_type(&ty, &subst)))
                     .collect();
-                generated_struct_names.insert(mangled);
-                new_structs.push(cloned);
-            }
-        }
 
-        // 3.5 生成具体枚举
-        // 关键新增：这一整段之前完全不存在——mir.rs 里 MirEnum 本来就带
-        // generic_params（跟 MirStruct 是同一个设计），意味着这门语言
-        // 的枚举（很可能包括 Option<T>/Result<T,E> 这类核心类型）本来
-        // 就可以是泛型的，但 monomorphic.rs 只处理了 struct，压根没碰
-        // enum——任何用到泛型枚举的程序，枚举定义会带着没法翻译成
-        // Rust 的 TypeParam 类型原样流到后面的阶段。这里补上跟 struct
-        // 完全对称的一套流程。
-        let mut new_enums = Vec::new();
-        let mut generated_enum_names: HashSet<String> = HashSet::new();
-        for (enum_name, type_args) in &enum_instances {
-            if let Some(base_enum) = program.enums.iter().find(|e| &e.name == enum_name) {
+                for (_, ty) in &cloned.fields {
+                    Self::collect_generic_types(ty, &mut struct_instances, &mut enum_instances);
+                }
+                Self::assert_no_unresolved_types_in_struct(&cloned, "struct monomorphization");
+                new_structs.push(cloned);
+                progressed = true;
+            }
+
+            while enum_index < enum_instances.len() {
+                let (enum_name, type_args) = enum_instances[enum_index].clone();
+                enum_index += 1;
+                if Self::contains_unresolved_type(&type_args) {
+                    continue;
+                }
+
+                let Some(base_enum) = all_enums.iter().find(|e| e.name == enum_name) else {
+                    continue;
+                };
                 if base_enum.generic_params.is_empty() {
                     continue;
                 }
-                let mangled = Self::mangled_name(&base_enum.name, type_args);
-                if generated_enum_names.contains(&mangled) {
+                if base_enum.generic_params.len() != type_args.len() {
+                    panic!(
+                        "monomorphization error: generic arity mismatch for enum `{}`: expected {}, got {}",
+                        enum_name,
+                        base_enum.generic_params.len(),
+                        type_args.len()
+                    );
+                }
+
+                let mangled = Self::mangled_name(&base_enum.name, &type_args);
+                if !generated_enum_names.insert(mangled.clone()) {
                     continue;
                 }
-                let mut subst = HashMap::new();
-                for (param, concrete) in base_enum.generic_params.iter().zip(type_args.iter()) {
-                    subst.insert(param.name.clone(), concrete.clone());
-                }
-                let mut cloned = base_enum.clone();
-                cloned.name = mangled.clone();
-                cloned.generic_params.clear();
-                cloned.variants = cloned.variants
-                    .into_iter()
-                    .map(|(name, ty_opt)| (name, ty_opt.map(|ty| Self::replace_type(&ty, &subst))))
+
+                let subst: HashMap<String, Type> = base_enum
+                    .generic_params
+                    .iter()
+                    .zip(type_args.iter())
+                    .map(|(param, concrete)| (param.name.clone(), concrete.clone()))
                     .collect();
-                generated_enum_names.insert(mangled);
+                let mut cloned = base_enum.clone();
+                cloned.name = mangled;
+                cloned.generic_params.clear();
+                cloned.variants = cloned
+                    .variants
+                    .into_iter()
+                    .map(|(name, ty)| {
+                        let ty = ty.map(|ty| Self::replace_type(&ty, &subst));
+                        if let Some(ref concrete_ty) = ty {
+                            Self::collect_generic_types(
+                                concrete_ty,
+                                &mut struct_instances,
+                                &mut enum_instances,
+                            );
+                        }
+                        (name, ty)
+                    })
+                    .collect();
+
+                Self::assert_no_unresolved_types_in_enum(&cloned, "enum monomorphization");
                 new_enums.push(cloned);
+                progressed = true;
+            }
+
+            if !progressed {
+                break;
             }
         }
 
-        // 4. 保留非泛型函数
-        // 5. 保留非泛型结构体/枚举
-        //
-        // 关键修复（这三处是同一个 bug，抄了三遍）：原来的条件是
-        // `x.generic_params.is_empty() || !used_xxx_names.contains(&x.name)`。
-        // `used_xxx_names`/`generated_xxx_names` 存的都是单态化之后的
-        // 名字（`identity_i32`、`Point_i32`），这里的 `x.name` 遍历的
-        // 却是原始、没改过的名字（`identity`、`Point`）——两者永远对
-        // 不上，`!contains(&x.name)` 恒为 true，等于这个"要不要保留
-        // 原始泛型模板"的判断从来没有生效过：不管一个泛型函数/结构体/
-        // 枚举有没有被用到、有没有生成具体版本，原始模板（参数/字段/
-        // 变体类型里还带着 TypeParam）都会原封不动地混进最终产物。
-        // TypeParam 不是一个 codegen 能翻译成具体 Rust 代码的类型，
-        // 这些模板留在最终产物里迟早在更后面的阶段炸掉。
-        //
-        // 正确的判断其实不需要"是否被用到"这个信息：泛型模板本身永远
-        // 不该原样进最终产物——用到的实例已经在上面单独生成过具体版本
-        // 了，没用到的就是死代码，两种情况下原始模板都该被丢弃，
-        // 直接按 `generic_params.is_empty()` 二选一即可。
+        // 原始泛型模板不能进入最终 MIR；最终产物必须是具体的。
         for f in all_fns {
             if f.generic_params.is_empty() {
                 new_fns.push(f);
@@ -181,7 +272,6 @@ impl Monomorphic {
         let enum_instance_names: HashSet<String> =
             new_enums.iter().map(|e| e.name.clone()).collect();
 
-        // 6. 替换所有函数体中的类型
         for f in &mut new_fns {
             for (_, ty) in f.params.iter_mut() {
                 Self::replace_generic_with_concrete(ty, &struct_instance_names, &enum_instance_names);
@@ -195,16 +285,27 @@ impl Monomorphic {
             for block in &mut f.body.blocks {
                 for stmt in &mut block.stmts {
                     if let MirStmt::Assign { value, .. } | MirStmt::ExprStmt(value) = stmt {
-                        Self::replace_type_in_rvalue(value, &struct_instance_names, &enum_instance_names);
+                        Self::replace_type_in_rvalue(
+                            value,
+                            &generated_fn_names,
+                            &struct_instance_names,
+                            &enum_instance_names,
+                        );
                     }
                 }
+                // Switch 的判别式类型也可能是泛型实例，要同样改写成具体名字。
+                if let MirTerminator::Switch { discr_ty, .. } = &mut block.terminator {
+                    Self::replace_generic_with_concrete(discr_ty, &struct_instance_names, &enum_instance_names);
+                }
             }
+            Self::assert_no_unresolved_types_in_fn(f, "final monomorphization");
         }
 
         for s in &mut new_structs {
             for (_, ty) in s.fields.iter_mut() {
                 Self::replace_generic_with_concrete(ty, &struct_instance_names, &enum_instance_names);
             }
+            Self::assert_no_unresolved_types_in_struct(s, "final monomorphization");
         }
         for e in &mut new_enums {
             for (_, ty_opt) in e.variants.iter_mut() {
@@ -212,17 +313,9 @@ impl Monomorphic {
                     Self::replace_generic_with_concrete(ty, &struct_instance_names, &enum_instance_names);
                 }
             }
+            Self::assert_no_unresolved_types_in_enum(e, "final monomorphization");
         }
 
-        // 关键修复（过期注释，跟下面的代码自相矛盾）：这段注释原来
-        // 说"这一轮先没做，需要在这之后单独一轮补上"——但下面紧接着
-        // 就调用了 `update_enum_names_in_fns`，这正是这一轮新加的、
-        // 用来补上这个缺口的实现：按每个 Discriminant/EnumPayload 的
-        // `base`/`value` 操作数对应的局部变量类型（第 6 步已经把泛型
-        // 枚举类型替换成具体的 `Type::Enum("Option_i32")` 这类名字了），
-        // 反查出正确的 enum_name 回填进去。留着"还没做"的说明会让下一
-        // 个读到这里的人误以为这个缺口还在，所以删掉，只留下面真正
-        // 在做这件事的调用和它自己的实现。
         Self::update_enum_names_in_fns(&mut new_fns);
 
         MirProgram {
@@ -233,6 +326,148 @@ impl Monomorphic {
             interfaces: program.interfaces,
             fns: new_fns,
             intrinsics_used: program.intrinsics_used,
+        }
+    }
+
+    fn contains_unresolved_type(tys: &[Type]) -> bool {
+        tys.iter().any(Self::type_contains_unresolved)
+    }
+
+    fn type_contains_unresolved(ty: &Type) -> bool {
+        match ty {
+            Type::TypeParam(_) | Type::SelfType => true,
+            Type::Generic(_, args) => args.iter().any(Self::type_contains_unresolved),
+            Type::Tuple(elems) => elems.iter().any(Self::type_contains_unresolved),
+            Type::Array(elem, _) => Self::type_contains_unresolved(elem),
+            Type::Ref { inner, .. }
+            | Type::Privacy(inner, _)
+            | Type::Slice(inner) => Self::type_contains_unresolved(inner),
+            Type::Tensor { dtype, .. } => Self::type_contains_unresolved(dtype),
+            _ => false,
+        }
+    }
+
+    fn collect_generic_types(
+        ty: &Type,
+        struct_out: &mut Vec<(String, Vec<Type>)>,
+        enum_out: &mut Vec<(String, Vec<Type>)>,
+    ) {
+        match ty {
+            Type::Generic(name, args) => {
+                if !Self::contains_unresolved_type(args) {
+                    // 这里不提前判断它究竟是 struct 还是 enum；两张表都收集，
+                    // 后续按定义表决定实际种类。
+                    Self::push_unique_instance(struct_out, name, args);
+                    Self::push_unique_instance(enum_out, name, args);
+                }
+                for arg in args {
+                    Self::collect_generic_types(arg, struct_out, enum_out);
+                }
+            }
+            Type::Tuple(elems) => {
+                for elem in elems {
+                    Self::collect_generic_types(elem, struct_out, enum_out);
+                }
+            }
+            Type::Array(elem, _) => Self::collect_generic_types(elem, struct_out, enum_out),
+            Type::Ref { inner, .. }
+            | Type::Privacy(inner, _)
+            | Type::Slice(inner) => Self::collect_generic_types(inner, struct_out, enum_out),
+            Type::Tensor { dtype, .. } => Self::collect_generic_types(dtype, struct_out, enum_out),
+            _ => {}
+        }
+    }
+
+    fn push_unique_instance(
+        out: &mut Vec<(String, Vec<Type>)>,
+        name: &str,
+        args: &[Type],
+    ) {
+        if !out.iter().any(|(n, a)| n == name && a == args) {
+            out.push((name.to_string(), args.to_vec()));
+        }
+    }
+
+    fn assert_no_unresolved_types_in_fn(f: &MirFn, phase: &str) {
+        for (_, ty) in &f.params {
+            Self::assert_concrete_type(ty, phase, &format!("function `{}` parameter", f.name));
+        }
+        if let Some(ty) = &f.return_type {
+            Self::assert_concrete_type(ty, phase, &format!("function `{}` return", f.name));
+        }
+        for local in &f.body.locals {
+            Self::assert_concrete_type(&local.ty, phase, &format!("function `{}` local", f.name));
+        }
+        for block in &f.body.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    MirStmt::Assign { value, .. } | MirStmt::ExprStmt(value) => {
+                        Self::assert_no_unresolved_types_in_rvalue(value, phase, &f.name);
+                    }
+                    MirStmt::Drop { .. } | MirStmt::SetMetadata { .. } | MirStmt::EffectCheck { .. } => {}
+                }
+            }
+            // 终止器里的 Switch.discr_ty 同样不能残留类型参数。
+            match &block.terminator {
+                MirTerminator::Switch { discr_ty, .. } => {
+                    Self::assert_concrete_type(discr_ty, phase, &format!("function `{}` switch discriminant", f.name));
+                }
+                MirTerminator::Goto(_)
+                | MirTerminator::If { .. }
+                | MirTerminator::Return(_)
+                | MirTerminator::Unreachable
+                | MirTerminator::Placeholder => {}
+            }
+        }
+    }
+
+    fn assert_no_unresolved_types_in_rvalue(rv: &MirRvalue, phase: &str, fn_name: &str) {
+        match rv {
+            MirRvalue::Cast(_, ty) => {
+                Self::assert_concrete_type(ty, phase, &format!("function `{}` cast", fn_name));
+            }
+            MirRvalue::StructInit { generic_args, .. }
+            | MirRvalue::EnumVariantConstruction { generic_args, .. }
+            | MirRvalue::Call { generic_args, .. }
+            | MirRvalue::MethodCall { generic_args, .. } => {
+                for ty in generic_args {
+                    Self::assert_concrete_type(
+                        ty,
+                        phase,
+                        &format!("function `{}` generic argument", fn_name),
+                    );
+                }
+            }
+            MirRvalue::Use(_)
+            | MirRvalue::BinaryOp(_, _, _)
+            | MirRvalue::UnaryOp(_, _)
+            | MirRvalue::Ref { .. }
+            | MirRvalue::ArrayLiteral(_)
+            | MirRvalue::Discriminant { .. }
+            | MirRvalue::Phi { .. } => {}
+        }
+    }
+
+    fn assert_no_unresolved_types_in_struct(s: &MirStruct, phase: &str) {
+        for (_, ty) in &s.fields {
+            Self::assert_concrete_type(ty, phase, &format!("struct `{}` field", s.name));
+        }
+    }
+
+    fn assert_no_unresolved_types_in_enum(e: &MirEnum, phase: &str) {
+        for (_, ty) in &e.variants {
+            if let Some(ty) = ty {
+                Self::assert_concrete_type(ty, phase, &format!("enum `{}` variant", e.name));
+            }
+        }
+    }
+
+    fn assert_concrete_type(ty: &Type, phase: &str, context: &str) {
+        if Self::type_contains_unresolved(ty) {
+            panic!(
+                "monomorphization error during {}: unresolved generic type in {}: {:?}",
+                phase, context, ty
+            );
         }
     }
 
@@ -293,17 +528,61 @@ impl Monomorphic {
             for stmt in &block.stmts {
                 let value = match stmt {
                     MirStmt::Assign { value, .. } | MirStmt::ExprStmt(value) => value,
-                    _ => continue,
+                    MirStmt::Drop { .. } | MirStmt::SetMetadata { .. } | MirStmt::EffectCheck { .. } => continue,
                 };
                 match value {
-                    MirRvalue::StructInit { struct_name, generic_args, .. } if !generic_args.is_empty() => {
-                        struct_out.push((struct_name.clone(), generic_args.clone()));
+                    MirRvalue::StructInit { struct_name, generic_args, .. }
+                        if !generic_args.is_empty() =>
+                    {
+                        if !Self::contains_unresolved_type(generic_args) {
+                            Self::push_unique_instance(struct_out, struct_name, generic_args);
+                        }
+                        for arg in generic_args {
+                            Self::collect_generic_types(arg, struct_out, enum_out);
+                        }
                     }
-                    MirRvalue::EnumVariantConstruction { enum_name, generic_args, .. } if !generic_args.is_empty() => {
-                        enum_out.push((enum_name.clone(), generic_args.clone()));
+                    MirRvalue::EnumVariantConstruction { enum_name, generic_args, .. }
+                        if !generic_args.is_empty() =>
+                    {
+                        if !Self::contains_unresolved_type(generic_args) {
+                            Self::push_unique_instance(enum_out, enum_name, generic_args);
+                        }
+                        for arg in generic_args {
+                            Self::collect_generic_types(arg, struct_out, enum_out);
+                        }
                     }
-                    _ => {}
+                    MirRvalue::Cast(_, ty) => {
+                        Self::collect_generic_types(ty, struct_out, enum_out);
+                    }
+                    MirRvalue::Call { generic_args, .. }
+                    | MirRvalue::MethodCall { generic_args, .. } => {
+                        for arg in generic_args {
+                            Self::collect_generic_types(arg, struct_out, enum_out);
+                        }
+                    }
+                    // 带 generic_args 但为空的 StructInit/EnumVariantConstruction（守卫
+                    // 没通过）以及不携带泛型实例的其余右值，没有要收集的东西。
+                    MirRvalue::StructInit { .. }
+                    | MirRvalue::EnumVariantConstruction { .. }
+                    | MirRvalue::Use(_)
+                    | MirRvalue::BinaryOp(_, _, _)
+                    | MirRvalue::UnaryOp(_, _)
+                    | MirRvalue::Ref { .. }
+                    | MirRvalue::ArrayLiteral(_)
+                    | MirRvalue::Discriminant { .. }
+                    | MirRvalue::Phi { .. } => {}
                 }
+            }
+            // Switch 的判别式类型里也可能首次出现某个泛型实例。
+            match &block.terminator {
+                MirTerminator::Switch { discr_ty, .. } => {
+                    Self::collect_generic_types(discr_ty, struct_out, enum_out);
+                }
+                MirTerminator::Goto(_)
+                | MirTerminator::If { .. }
+                | MirTerminator::Return(_)
+                | MirTerminator::Unreachable
+                | MirTerminator::Placeholder => {}
             }
         }
     }
@@ -335,6 +614,10 @@ impl Monomorphic {
             Type::Slice(inner) => {
                 Type::Slice(Box::new(Self::replace_type(inner, subst)))
             }
+            Type::Tensor { dtype, shape } => Type::Tensor {
+                dtype: Box::new(Self::replace_type(dtype, subst)),
+                shape: shape.clone(), // Sym 不参与类型替换
+            },
             _ => ty.clone(),
         }
     }
@@ -360,9 +643,13 @@ impl Monomorphic {
             new_blocks.push(new_block);
         }
 
+        // 关键修复：MirBody 新增了 revision 字段，这里必须带上。块的集合、
+        // 编号都没变（只替换了类型），所以原样继承 revision，不自增——
+        // 自增只在增删块/重编号时发生（见 MirBody::revision 的说明）。
         MirBody {
             locals: new_locals,
             blocks: new_blocks,
+            revision: body.revision,
         }
     }
 
@@ -375,7 +662,8 @@ impl Monomorphic {
                 }
             }
             MirStmt::ExprStmt(value) => MirStmt::ExprStmt(Self::replace_rvalue(value, subst)),
-            _ => stmt.clone(),
+            // 这三种不携带需要替换的类型；显式列出，新增语句变体时编译器会提醒。
+            MirStmt::Drop { .. } | MirStmt::SetMetadata { .. } | MirStmt::EffectCheck { .. } => stmt.clone(),
         }
     }
 
@@ -453,11 +741,25 @@ impl Monomorphic {
         }
     }
 
-    fn replace_terminator(term: &MirTerminator, _subst: &HashMap<String, Type>) -> MirTerminator {
-        // 终结指令里的操作数（If.cond / Switch.discr / Return 的值）
-        // 都是 MirOperand，只可能是 Copy/Move/Constant，不携带类型
-        // 信息，这里没有类型可替换，原样 clone。
-        term.clone()
+    // 终止器里的操作数（If.cond / Switch.discr / Return 的值）是 MirOperand，
+    // 不携带类型；但 Switch 自己带着 discr_ty（判别式的类型），它可能引用
+    // 函数的类型参数（`match x` 里 x: T 单态化成 Option<T> 时），必须
+    // 随函数体一起替换。原来这里整个 clone，discr_ty 里的 TypeParam 会
+    // 原样留到 codegen。
+    fn replace_terminator(term: &MirTerminator, subst: &HashMap<String, Type>) -> MirTerminator {
+        match term {
+            MirTerminator::Switch { discr, discr_ty, targets, default } => MirTerminator::Switch {
+                discr: discr.clone(),
+                discr_ty: Self::replace_type(discr_ty, subst),
+                targets: targets.clone(),
+                default: *default,
+            },
+            MirTerminator::Goto(_)
+            | MirTerminator::If { .. }
+            | MirTerminator::Return(_)
+            | MirTerminator::Unreachable
+            | MirTerminator::Placeholder => term.clone(),
+        }
     }
 
     // 关键修复：改名 + 扩展成同时认 struct 和 enum 两套具体实例名字。
@@ -499,12 +801,21 @@ impl Monomorphic {
             Type::Slice(inner) => {
                 Self::replace_generic_with_concrete(inner.as_mut(), struct_instances, enum_instances);
             }
+            // 张量的元素类型也可能是泛型实例（Tensor<Wrapper<f32>>），
+            // 跟 replace_type / collect_generic_types 的覆盖范围对齐。
+            Type::Tensor { dtype, .. } => {
+                Self::replace_generic_with_concrete(dtype.as_mut(), struct_instances, enum_instances);
+            }
+            // 其余类型（标量、Struct/Enum 具名类型、TypeParam 等）里没有
+            // 嵌套的 Generic 可改写。Type 变体很多，这里的通配就是对它们的
+            // 正确回答；新增带子类型的变体时必须在上面补分支。
             _ => {}
         }
     }
 
     fn replace_type_in_rvalue(
         rv: &mut MirRvalue,
+        fn_instances: &HashSet<String>,
         struct_instances: &HashSet<String>,
         enum_instances: &HashSet<String>,
     ) {
@@ -512,14 +823,38 @@ impl Monomorphic {
             MirRvalue::Cast(_, ty) => {
                 Self::replace_generic_with_concrete(ty, struct_instances, enum_instances);
             }
-            MirRvalue::Call { generic_args, .. } => {
+            MirRvalue::Call { func, generic_args, .. } => {
                 for ty in generic_args.iter_mut() {
                     Self::replace_generic_with_concrete(ty, struct_instances, enum_instances);
                 }
+                if !generic_args.is_empty() {
+                    let mangled = Self::mangled_name(func, generic_args);
+                    if fn_instances.contains(&mangled) {
+                        *func = mangled;
+                        generic_args.clear();
+                    } else if !Self::contains_unresolved_type(generic_args) {
+                        panic!(
+                            "monomorphization error: generic function instance `{}` was not generated",
+                            mangled
+                        );
+                    }
+                }
             }
-            MirRvalue::MethodCall { generic_args, .. } => {
+            MirRvalue::MethodCall { method, generic_args, .. } => {
                 for ty in generic_args.iter_mut() {
                     Self::replace_generic_with_concrete(ty, struct_instances, enum_instances);
+                }
+                if !generic_args.is_empty() {
+                    let mangled = Self::mangled_name(method, generic_args);
+                    if fn_instances.contains(&mangled) {
+                        *method = mangled;
+                        generic_args.clear();
+                    } else if !Self::contains_unresolved_type(generic_args) {
+                        panic!(
+                            "monomorphization error: generic method instance `{}` was not generated",
+                            mangled
+                        );
+                    }
                 }
             }
             // 关键新增：StructInit/EnumVariantConstruction 原来完全没
@@ -541,6 +876,11 @@ impl Monomorphic {
                     if struct_instances.contains(&mangled) {
                         *struct_name = mangled;
                         generic_args.clear();
+                    } else if !Self::contains_unresolved_type(generic_args) {
+                        panic!(
+                            "monomorphization error: generic struct instance `{}` was not generated",
+                            mangled
+                        );
                     }
                 }
             }
@@ -550,10 +890,21 @@ impl Monomorphic {
                     if enum_instances.contains(&mangled) {
                         *enum_name = mangled;
                         generic_args.clear();
+                    } else if !Self::contains_unresolved_type(generic_args) {
+                        panic!(
+                            "monomorphization error: generic enum instance `{}` was not generated",
+                            mangled
+                        );
                     }
                 }
             }
-            _ => {}
+            MirRvalue::Use(_)
+            | MirRvalue::BinaryOp(_, _, _)
+            | MirRvalue::UnaryOp(_, _)
+            | MirRvalue::ArrayLiteral(_)
+            | MirRvalue::Discriminant { .. }
+            | MirRvalue::Phi { .. }
+            | MirRvalue::Ref { .. } => {}
         }
     }
 
@@ -629,8 +980,17 @@ impl Monomorphic {
                 format!("slice_{}", Self::type_to_string(inner))
             }
 
-            // 隐私类型（剥离标签，只保留内部类型）
-            Type::Privacy(inner, _) => Self::type_to_string(inner),
+            // 隐私类型：标签必须进名字。原来剥掉标签，`Box<Private<i32>>` 和
+            // `Box<i32>` 会得到同一个 mangled 名，两个不同的实例（实例表按完整
+            // Type 去重）生成出重名的结构体/函数。Debug 输出里的符号统一压成
+            // 下划线，保证是合法标识符片段。
+            Type::Privacy(inner, tag) => {
+                let tag_str: String = format!("{:?}", tag)
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect();
+                format!("priv_{}_{}", tag_str, Self::type_to_string(inner))
+            }
 
             // 张量
             Type::Tensor { dtype, shape } => {
@@ -694,11 +1054,26 @@ impl Monomorphic {
                     MirStmt::SetMetadata { place, .. } => {
                         Self::update_enum_names_in_place(place, locals);
                     }
-                    _ => {}
+                    MirStmt::EffectCheck { .. } => {}
                 }
             }
-            // 终止器中的 cond 和 discr 是 MirOperand，但 Discriminant 已经在 Rvalue 中处理了，
-            // 所以不需要再处理终止器。
+            Self::update_enum_names_in_terminator(&mut block.terminator, locals);
+        }
+    }
+
+    // 终止器里的 cond / discr 是 MirOperand，可以是
+    // MirOperand::Copy(MirPlace::EnumPayload { base, enum_name, .. })——
+    // 跟语句里的 Rvalue 一样需要把 enum_name 更新成单态化后的具体枚举名，
+    // 不能因为 Discriminant 已经在 Rvalue 里处理过就跳过这里。
+    fn update_enum_names_in_terminator(term: &mut MirTerminator, locals: &[MirLocal]) {
+        match term {
+            MirTerminator::If { cond, .. } => Self::update_enum_names_in_operand(cond, locals),
+            MirTerminator::Switch { discr, .. } => Self::update_enum_names_in_operand(discr, locals),
+            MirTerminator::Return(Some(op)) => Self::update_enum_names_in_operand(op, locals),
+            MirTerminator::Goto(_)
+            | MirTerminator::Return(None)
+            | MirTerminator::Unreachable
+            | MirTerminator::Placeholder => {}
         }
     }
 

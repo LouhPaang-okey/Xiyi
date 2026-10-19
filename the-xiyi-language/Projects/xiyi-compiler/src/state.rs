@@ -19,7 +19,7 @@ use crate::ast::Type;
 use crate::ast::Literal;
 use crate::mir::*;
 use crate::mir_builder::{LoopCtx, LoopPhiInfo, MirBuilder};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 impl MirBuilder {
     // -------- 局部变量 --------
@@ -51,8 +51,22 @@ impl MirBuilder {
         id
     }
 
+    // 关键修复：SSA 版本号的分配只有这一个出口。原来 ssa_versions 同时
+    // 当"当前读到哪个版本"和"下一个版本号是多少"两张表用，分支处理里
+    // 这两个职责是冲突的：else 分支的读取要回到分支之前的版本（需要把
+    // ssa_versions 回滚），但 else 分支里新赋的值绝不能拿到 then 分支
+    // 已经用过的版本号（不能回滚计数），否则两条分支各造一个同名的
+    // x_6，"每个 SSA 值只定义一次"就破了，后面 SCCP/GVN 拿同名值当同一个
+    // 值处理，得出的是错误结论。所以拆成两张表：ssa_versions 管"当前
+    // 版本"，可以随分支保存/恢复；ssa_next 管"已分配的最大版本"，只增
+    // 不减，任何路径都不回滚它。
+    //
+    // 调用方不许再手写 `get + 1 + insert` 自己算版本号——那样绕过
+    // ssa_next，回滚之后就会重复发号。
     pub(crate) fn new_version(&mut self, base_id: usize) -> u32 {
-        let ver = self.ssa_versions.get(&base_id).copied().unwrap_or(0) + 1;
+        let next = self.ssa_next.entry(base_id).or_insert(0);
+        *next += 1;
+        let ver = *next;
         self.ssa_versions.insert(base_id, ver);
         ver
     }
@@ -64,6 +78,109 @@ impl MirBuilder {
     pub(crate) fn current_ssa(&self, base_id: usize) -> SsaLocal {
         let version = self.ssa_versions.get(&base_id).copied().unwrap_or(0);
         SsaLocal { base_id, version }
+    }
+
+    // ===== 分支汇合：版本快照的恢复与 Phi =====
+    //
+    // 关键设计：if/match 的每条分支都必须从"分支之前"的变量版本出发，
+    // 互不看见对方的赋值；汇合点再把"各条分支结束时读到的版本"用 Phi
+    // 合成一个。restore_versions 负责前一半，emit_join_phis 负责后一半。
+
+    // 关键修复：只回滚 id < locals_limit 的那部分（分支之前就存在的
+    // 变量），id >= locals_limit 的条目（分支内部才创建的 local、以及
+    // 汇合用的 dest_base 之类临时变量）原样保留，不能整张表替换成快照。
+    // 原因：这些临时变量可能登记在分支外层的作用域里（比如 `else if`
+    // 链里嵌套的那层 if 没有自己的 Block，它的临时变量就挂在外层
+    // scope_vars 上），作用域结束时 emit_drops_for_scopes 用
+    // current_ssa 去查它们的版本、再去 moved 里比对——版本被整张表
+    // 替换抹回 0，查出来的是一个从没被赋值过的 t_0，比对不上 moved，
+    // 就会给它生成一条 Drop，对一个从未初始化的变量调用 drop()。
+    pub(crate) fn restore_versions(&mut self, snapshot: &HashMap<usize, u32>, locals_limit: usize) {
+        self.ssa_versions.retain(|&id, _| id >= locals_limit);
+        for (&id, &ver) in snapshot {
+            if id < locals_limit {
+                self.ssa_versions.insert(id, ver);
+            }
+        }
+    }
+
+    // 在当前块（调用方已经 switch 到汇合块）里，为"各条存活路径上版本
+    // 不一致"的既有变量插 Phi，并把每个变量的当前版本设成汇合之后该
+    // 读的那个：
+    //   - 所有路径版本一致（含只剩一条存活路径）：不需要 Phi，直接沿用
+    //     那个版本。只剩一条路径时汇合块只有一个前驱，这条路径上的
+    //     定义天然支配汇合块，插单路 Phi 只会增加噪声。
+    //   - 版本不一致：new_version 出一个新版本，Phi 的 incoming 按 arms
+    //     的顺序逐条列出（前驱块 id, 该路径上的版本）。
+    // arms 只包含"真的会走到汇合块"的路径（发散的分支不在里面）；
+    // 每一项的版本表必须是那条路径结束时 ssa_versions 的完整拷贝。
+    //
+    // 先无条件把 id < locals_limit 的版本回滚到 base（见 restore_versions
+    // 的说明）：发散分支留在 ssa_versions 里的版本，定义只存在于一条
+    // 走不到汇合块的路径上，汇合之后绝不能被读到。
+    //
+    // 遍历用 BTreeSet 保证按 id 升序——HashSet 的迭代顺序每次运行都
+    // 不同，生成的 MIR 就会不确定，diff/调试/快照测试全都没法做。
+    pub(crate) fn emit_join_phis(
+        &mut self,
+        base: &HashMap<usize, u32>,
+        locals_limit: usize,
+        arms: &[(usize, HashMap<usize, u32>)],
+    ) {
+        self.restore_versions(base, locals_limit);
+        if arms.is_empty() {
+            return;
+        }
+
+        let mut ids: BTreeSet<usize> = BTreeSet::new();
+        for &id in base.keys() {
+            if id < locals_limit {
+                ids.insert(id);
+            }
+        }
+        for (_, versions) in arms {
+            for &id in versions.keys() {
+                if id < locals_limit {
+                    ids.insert(id);
+                }
+            }
+        }
+
+        for id in ids {
+            // arms 里的版本表是完整拷贝，没有条目就是从未被赋值过（版本 0）。
+            let per_arm: Vec<u32> = arms
+                .iter()
+                .map(|(_, versions)| versions.get(&id).copied().unwrap_or(0))
+                .collect();
+            let first = per_arm[0];
+            if per_arm.iter().all(|&v| v == first) {
+                self.ssa_versions.insert(id, first);
+                continue;
+            }
+
+            let phi_ver = self.new_version(id);
+            let phi_ssa = SsaLocal { base_id: id, version: phi_ver };
+            let mut values = Vec::with_capacity(arms.len());
+            let mut any_moved = false;
+            for ((pred_block, _), &ver) in arms.iter().zip(per_arm.iter()) {
+                let incoming = SsaLocal { base_id: id, version: ver };
+                if self.moved.contains(&incoming) {
+                    any_moved = true;
+                }
+                values.push((*pred_block, MirOperand::Move(MirPlace::Ssa(incoming))));
+            }
+            // moved 是按具体版本登记的，新造的 Phi 版本天生不在里面。只要有
+            // 一条路径上这个变量已经被移走，汇合之后它就是"可能已被移走"，
+            // 作用域结束时不能再对它显式 Drop——跟 moved 字段一直以来的取舍
+            // 一致：宁可少 Drop，也不能对可能已移动的值调用 drop()。
+            if any_moved {
+                self.moved.insert(phi_ssa);
+            }
+            self.push_stmt(MirStmt::Assign {
+                dest: MirPlace::Ssa(phi_ssa),
+                value: MirRvalue::Phi { values },
+            });
+        }
     }
 
     // 关键修复：FieldAccess/Index 读一个字段/下标（`let x = p.x;`/
@@ -261,26 +378,82 @@ impl MirBuilder {
     // （mir_builder.rs 的 While/Loop 分支）在插好循环头 Phi、算出
     // continue 该去的块之后就已经手上有的信息，这里只是原样存进
     // LoopCtx，供之后 HirStmt::Continue 分支从栈顶取用。
+    //
+    // 关键新增（SSA 强化）：LoopCtx 现在还带着三样东西——
+    //   header_versions：循环头 Phi 插完之后 ssa_versions 的快照，回边/
+    //     continue 处用它检查"有没有变量在循环里被改写却没有 Phi"；
+    //   locals_limit：进入循环时 locals 的数量，id 比它小的才是循环外
+    //     的变量；
+    //   break_arms：每个 break 发生时（所在块，当时的版本表）——它们
+    //     和 While 条件为假的那条边一起，构成循环出口的全部前驱，出口
+    //     处按这些路径汇合变量版本。
     pub(crate) fn push_loop(
         &mut self,
         continue_target: usize,
         break_target: usize,
         loop_phis: Vec<LoopPhiInfo>,
+        header_versions: HashMap<usize, u32>,
+        locals_limit: usize,
     ) {
         self.loop_stack.push(LoopCtx {
             continue_target,
             break_target,
             scope_depth: self.scope_vars.len(),
             loop_phis,
+            header_versions,
+            locals_limit,
+            break_arms: Vec::new(),
         });
     }
 
     // 循环体构建完毕（不管成功还是中途报错）都要弹栈，避免栈里留着
     // 一层已经不存在的循环，把外层同名/同层级的另一个循环的 break
     // 误导到这层失效的目标上。调用点用"先 pop 再 `?` 传播错误"的顺序
-    // 保证这一点，见 mir_builder.rs 里 While/Loop 分支的写法。
-    pub(crate) fn pop_loop(&mut self) {
-        self.loop_stack.pop();
+    // 保证这一点，见 mir_builder.rs 里 While/Loop 分支的写法。弹出的
+    // LoopCtx 交还给调用方——出口汇合要用里面收集到的 break_arms。
+    pub(crate) fn pop_loop(&mut self) -> Option<LoopCtx> {
+        self.loop_stack.pop()
+    }
+
+    // 关键新增：循环携带变量的健全性检查。循环头只给"循环体里被赋值过
+    // 的变量"插 Phi，而"哪些变量被赋值过"靠 collect_modified_vars_* 预
+    // 扫描——它明说了覆盖不全（比如藏在算术子表达式里的赋值块）。漏扫
+    // 的后果是静默的：变量在循环里被改写了，但循环头没有 Phi，第二轮
+    // 迭代读到的还是进入循环之前的旧版本，生成的程序悄悄算错。这里在
+    // 每条回边（正常掉出尾部、continue）上对比当前版本表和循环头的
+    // 快照：循环外的变量、没有 Phi、版本却变了，就直接报错，不让它
+    // 静默通过。
+    pub(crate) fn check_loop_carried(
+        locals: &[MirLocal],
+        ctx: &LoopCtx,
+        current: &HashMap<usize, u32>,
+    ) -> Result<(), String> {
+        let mut offending: BTreeSet<usize> = BTreeSet::new();
+        for (&id, &ver) in current {
+            if id >= ctx.locals_limit {
+                continue;
+            }
+            if ctx.loop_phis.iter().any(|p| p.base_id == id) {
+                continue;
+            }
+            let before = ctx.header_versions.get(&id).copied().unwrap_or(0);
+            if ver != before {
+                offending.insert(id);
+            }
+        }
+        if let Some(&id) = offending.iter().next() {
+            let name = locals
+                .get(id)
+                .and_then(|l| l.name.clone())
+                .unwrap_or_else(|| format!("#{}", id));
+            return Err(format!(
+                "internal error: 变量 `{}` 在循环体内被改写，但循环头没有为它插入 Phi \
+                 （collect_modified_vars_* 漏扫了某种写入位置）——继续构建会让第二轮\
+                 迭代读到过期版本",
+                name
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn bind(&mut self, name: String, id: usize) {

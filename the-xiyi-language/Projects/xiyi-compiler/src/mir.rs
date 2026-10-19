@@ -114,6 +114,61 @@ pub struct MirFn {
 pub struct MirBody {
     pub locals: Vec<MirLocal>,
     pub blocks: Vec<MirBlock>,
+    /// CFG 修订号：**只在块的集合或块的编号变化时**自增（增删块、重编号）。
+    /// 所有按块编号索引的分析快照（CfgInfo / SccpResult / LoopInfo / AliasInfo /
+    /// AvailableExprs ……）都基于某个修订号，号变了快照立刻作废。
+    ///
+    /// 只改终止器（改边）、只挪/改语句的 pass **不**自增：那样不会让快照里的
+    /// 块编号错位，自增反而会让 AnalysisResults::matches 误判快照失效，
+    /// 下游依赖快照的 pass（比如 remove_dead_blocks）就跳过本该做的工作。
+    ///
+    /// 只比较块数不够：一个只调换块顺序、不改块数的 pass 会让按编号索引的
+    /// 快照全部错位，块数却还对得上。修订号就是为了把这种情况也拦住。
+    pub revision: u64,
+}
+
+impl MirBody {
+    /// 块的集合或编号变化之后调用（增删块、重编号）。
+    pub fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+/// 新 SSA 版本号的分配器。给一个已有变量（base_id）造新版本的 pass（比如 PRE
+/// 在合并点插 Phi）用它：新版本号取"这个变量在函数里已经出现过的最大定义
+/// 版本 + 1"，不会跟现有的任何定义撞名。
+///
+/// 只扫描 Assign 的 SSA 目标。函数参数的版本号不在 Assign 里，但它们的
+/// base_id 没有对应的 Assign 定义时压根不会向这个分配器要号（要号总是
+/// "已经有一条定义的变量"，起点由那条定义推出来），所以不会撞到参数版本。
+/// 一个分配器对应一份 body 的快照：body 里新增了定义之后要重建。
+#[derive(Debug, Clone)]
+pub struct VersionAllocator {
+    next: std::collections::HashMap<usize, u32>,
+}
+
+impl VersionAllocator {
+    pub fn new(body: &MirBody) -> Self {
+        let mut next: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                if let MirStmt::Assign { dest: MirPlace::Ssa(s), .. } = stmt {
+                    let entry = next.entry(s.base_id).or_insert(0);
+                    if s.version >= *entry {
+                        *entry = s.version + 1;
+                    }
+                }
+            }
+        }
+        VersionAllocator { next }
+    }
+
+    pub fn alloc(&mut self, base_id: usize) -> SsaLocal {
+        let e = self.next.entry(base_id).or_insert(0);
+        let v = *e;
+        *e += 1;
+        SsaLocal { base_id, version: v }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +223,11 @@ pub enum MirStmt {
     EffectCheck { effect: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// 关键新增：补上 PartialOrd/Ord（按 base_id、再按 version 字典序）。GVN 的
+// 表达式 key 要给操作数一个全序，才能把 `a + b` 和 `b + a` 排成同一个
+// 形状（见 analyze.rs 的 OperandKey）；以后想用 BTreeSet/BTreeMap 得到
+// 确定的遍历顺序也需要它。纯 (usize, u32) 两个字段，派生没有任何副作用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SsaLocal {
     pub base_id: usize,
     pub version: u32,
@@ -385,4 +444,302 @@ pub enum MirTerminator {
         targets: Vec<(Literal, usize)>,
         default: usize,
     },
+}
+
+// ==================== 终止器的目标块访问 ====================
+//
+// 关键重构：以前"这个终止器指向哪些块"这段 match（Goto/If/Switch 各写
+// 一遍、其余变体空着）在 analyze.rs、control.rs 的好几个 pass 里逐字
+// 重复，每新增一个 MirTerminator 变体就要同步改一串地方，漏掉哪一处都
+// 不会有编译错误——通配分支会悄悄把新变体当成"没有后继"，后果是块被
+// 误判为不可达而删掉。现在全部收拢到这里：唯一一个必须显式列出所有
+// 变体的地方，新增变体时只有这里会编译失败，逼着当场回答"它指向哪些
+// 块"。
+//
+// 这几个方法都不做越界过滤：过滤是调用方的责任，因为不同调用方对
+// "目标块 id 越界"的处理本来就不同——建前驱表时是跳过，删块后重映射时
+// 是转成 Unreachable，重定向时是原样保留——统一在这里选一种，反而会
+// 替某些调用方做出错误的决定。
+impl MirTerminator {
+    /// 按固定顺序（Goto；If 的 then、else；Switch 的 default、各 target）
+    /// 依次访问每一个目标块 id。同一个目标出现多次就访问多次，不去重。
+    pub fn for_each_target<F: FnMut(usize)>(&self, mut f: F) {
+        match self {
+            MirTerminator::Goto(t) => f(*t),
+            MirTerminator::If { then_block, else_block, .. } => {
+                f(*then_block);
+                f(*else_block);
+            }
+            MirTerminator::Switch { targets, default, .. } => {
+                f(*default);
+                for (_, t) in targets {
+                    f(*t);
+                }
+            }
+            MirTerminator::Return(_)
+            | MirTerminator::Unreachable
+            | MirTerminator::Placeholder => {}
+        }
+    }
+
+    /// 同 for_each_target，但给的是可写引用，用来原地改写目标块 id
+    /// （重定向、重编号）。访问顺序与 for_each_target 完全一致。
+    pub fn for_each_target_mut<F: FnMut(&mut usize)>(&mut self, mut f: F) {
+        match self {
+            MirTerminator::Goto(t) => f(t),
+            MirTerminator::If { then_block, else_block, .. } => {
+                f(then_block);
+                f(else_block);
+            }
+            MirTerminator::Switch { targets, default, .. } => {
+                f(default);
+                for (_, t) in targets.iter_mut() {
+                    f(t);
+                }
+            }
+            MirTerminator::Return(_)
+            | MirTerminator::Unreachable
+            | MirTerminator::Placeholder => {}
+        }
+    }
+
+    /// 把 for_each_target 访问到的目标收集成 Vec（含重复、含越界）。
+    pub fn targets(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.for_each_target(|t| out.push(t));
+        out
+    }
+}
+
+impl MirBody {
+    /// 一次扫描同时建好后继表和前驱表，两张表都是"边集合"语义：
+    ///   - 越界的目标块 id 直接丢弃（畸形 MIR 不该让建表这一步 panic）；
+    ///   - 同一个块指向同一个目标的多条边（`If` 两边同一目标、`Switch`
+    ///     多个值落到同一目标）只算一条——这些调用方关心的是"有哪些
+    ///     不同的前驱/后继块"，不是"有多少条边"。
+    ///   - 前驱表每一项按块 id 升序（因为是按 src 升序扫描填的）；后继表
+    ///     保持终止器里的访问顺序，只去掉重复项。
+    ///
+    /// 这是全项目唯一一处把"终止器"翻译成"边表"的地方：CfgInfo::build
+    /// 和 control.rs 里各个需要前驱信息的 pass 都建在它上面，不再各自
+    /// 重写一遍扫描。
+    pub fn edge_tables(&self) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        let n = self.blocks.len();
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (src, block) in self.blocks.iter().enumerate() {
+            block.terminator.for_each_target(|t| {
+                if t >= n {
+                    return;
+                }
+                // 用 contains 去重而不是只比较"上一个"：Switch 里同一目标可以
+                // 不相邻地出现（A B A）。一个块的后继通常只有几个，线性查找
+                // 比引入 HashSet 便宜。
+                if !successors[src].contains(&t) {
+                    successors[src].push(t);
+                    predecessors[t].push(src);
+                }
+            });
+        }
+        (successors, predecessors)
+    }
+
+    /// 只要前驱表的调用方用这个（内部仍是同一次扫描，多算的后继表
+    /// 开销可以忽略）。
+    pub fn predecessor_table(&self) -> Vec<Vec<usize>> {
+        self.edge_tables().1
+    }
+}
+
+// ==================== 块的删除、重编号与 Phi 前驱重映射 ====================
+//
+// 关键重构：control.rs::remove_unreachable_blocks 和 simplify.rs::
+// remove_dead_blocks 原来各有一份约 80 行近乎逐字相同的实现（建 id_map、
+// 压缩块数组、重映射终止器目标、重映射 Phi incoming），唯一的区别是"哪些
+// 块保留"这个决策——一个用结构可达性，一个用 SCCP 的可执行性。两份各自
+// 演化的结果就是 Switch 缺 default 时的兜底在一边是 Unreachable、另一边
+// 悄悄挑第一个显式分支。现在"怎么删"只有这里一份，"删哪些"留给调用方。
+impl MirBody {
+    /// Phi 的 incoming 是 (前驱块 id, 值)。任何会删除/重编号块的操作都
+    /// 必须调用它：块 id 换了而 Phi 里记的前驱 id 没跟着换，SCCP（按
+    /// (pred, block) 查可执行边）和 GVN 读到的就是错位的前驱，可能把别的
+    /// 路径上的值当成这条路径的。前驱已被删除的 incoming 直接丢弃——那条
+    /// 路径已经不存在了。
+    pub fn remap_phi_preds(blocks: &mut [MirBlock], id_map: &[Option<usize>]) {
+        for block in blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmt::Assign { value: MirRvalue::Phi { values }, .. } = stmt {
+                    let mut remapped: Vec<(usize, MirOperand)> = Vec::with_capacity(values.len());
+                    for (pred, op) in values.iter() {
+                        if let Some(Some(new_pred)) = id_map.get(*pred) {
+                            remapped.push((*new_pred, op.clone()));
+                        }
+                    }
+                    *values = remapped;
+                }
+            }
+        }
+    }
+
+    /// 按 keep 掩码保留块，重编号，并重映射所有终止器目标和 Phi incoming。
+    ///
+    /// 语义：keep[i] == false 表示第 i 个块被删除。指向被删块（或者本来
+    /// 就越界）的边按下面的统一策略处理——这是全项目唯一做这个决策的地方：
+    ///   - Goto：目标没了 -> Unreachable；
+    ///   - If：只剩一边能解析 -> 退化成 Goto 那一边；两边都没了 -> Unreachable；
+    ///   - Switch：default 没了 -> 整个退化成 Unreachable（不挑一个显式分支
+    ///     顶替：default 的语义是"不匹配任何显式值时走哪"，随便换成某个显式
+    ///     分支会让一部分取值静默走进别的分支，比崩溃更难查）；default 还在
+    ///     但显式分支全没了 -> 退化成 Goto(default)；
+    ///   - 所有目标都能解析：只做编号替换，不改终止器的形状。
+    ///
+    /// 返回值：是否真的删了块。keep 全 true 时返回 false，什么都不改写。
+    ///
+    /// 不变量：keep.len() 必须等于块数，keep[0]（入口块）必须为 true。违反
+    /// 时 debug 构建断言失败，release 构建拒绝执行（返回 false）——宁可少
+    /// 优化一次，也不对一个形状不对的掩码做破坏性改写。
+    pub fn retain_and_renumber_blocks(&mut self, keep: &[bool]) -> bool {
+        let n = self.blocks.len();
+        if n == 0 {
+            return false;
+        }
+        if keep.len() != n {
+            debug_assert!(false, "retain_and_renumber_blocks: keep 掩码长度和块数不一致");
+            return false;
+        }
+        if !keep[0] {
+            debug_assert!(false, "retain_and_renumber_blocks: 入口块不能被删除");
+            return false;
+        }
+        if keep.iter().all(|&k| k) {
+            return false;
+        }
+
+        let mut id_map: Vec<Option<usize>> = vec![None; n];
+        let mut new_count = 0usize;
+        for old_id in 0..n {
+            if keep[old_id] {
+                id_map[old_id] = Some(new_count);
+                new_count += 1;
+            }
+        }
+
+        // 原地压缩：双指针把保留的块 swap 到数组前部再截断。不新建 Vec、
+        // 不 clone 块——MirStmt 里带着 Vec/String，整块深拷贝是 O(总语句数)，
+        // 而这个操作在外层不动点循环里每轮都可能发生。被删块的内容随着
+        // truncate 直接释放。
+        let mut write = 0usize;
+        for read in 0..n {
+            if keep[read] {
+                if write != read {
+                    self.blocks.swap(write, read);
+                }
+                write += 1;
+            }
+        }
+        self.blocks.truncate(write);
+
+        // 块自带的 id 字段要跟着换成新下标：原来的删块/折叠代码都没有维护
+        // 它，id 和下标于是悄悄脱节。任何靠 id 做标签的下游都会读到旧值。
+        for (new_id, block) in self.blocks.iter_mut().enumerate() {
+            block.id = new_id;
+        }
+
+        // 越界和"被删掉"统一当成"解析不到"，用 get 而不是裸下标——畸形 MIR
+        // 里目标本身就可能越界，不该让这一步 panic。
+        let lookup = |id: usize| -> Option<usize> { id_map.get(id).copied().flatten() };
+
+        for block in self.blocks.iter_mut() {
+            let mut all_resolved = true;
+            block.terminator.for_each_target(|t| {
+                if lookup(t).is_none() {
+                    all_resolved = false;
+                }
+            });
+            if all_resolved {
+                block.terminator.for_each_target_mut(|t| {
+                    if let Some(new_target) = lookup(*t) {
+                        *t = new_target;
+                    }
+                });
+                continue;
+            }
+
+            // 有目标解析不到：按上面的统一策略决定终止器的新形状。
+            let new_terminator: Option<MirTerminator> = match &block.terminator {
+                MirTerminator::Goto(_) => Some(MirTerminator::Unreachable),
+                MirTerminator::If { cond, then_block, else_block } => {
+                    match (lookup(*then_block), lookup(*else_block)) {
+                        (Some(nt), Some(ne)) => Some(MirTerminator::If {
+                            cond: cond.clone(),
+                            then_block: nt,
+                            else_block: ne,
+                        }),
+                        (Some(nt), None) => Some(MirTerminator::Goto(nt)),
+                        (None, Some(ne)) => Some(MirTerminator::Goto(ne)),
+                        (None, None) => Some(MirTerminator::Unreachable),
+                    }
+                }
+                MirTerminator::Switch { discr, discr_ty, targets, default } => {
+                    match lookup(*default) {
+                        None => Some(MirTerminator::Unreachable),
+                        Some(new_default) => {
+                            let mut new_targets: Vec<(Literal, usize)> = Vec::with_capacity(targets.len());
+                            for (val, target) in targets.iter() {
+                                if let Some(new_target) = lookup(*target) {
+                                    new_targets.push((val.clone(), new_target));
+                                }
+                            }
+                            if new_targets.is_empty() {
+                                Some(MirTerminator::Goto(new_default))
+                            } else {
+                                Some(MirTerminator::Switch {
+                                    discr: discr.clone(),
+                                    discr_ty: discr_ty.clone(),
+                                    targets: new_targets,
+                                    default: new_default,
+                                })
+                            }
+                        }
+                    }
+                }
+                // 这三种没有任何目标，all_resolved 必然为 true，走不到这里；
+                // 显式列出来是为了让 MirTerminator 新增变体时这里编译失败。
+                MirTerminator::Return(_)
+                | MirTerminator::Unreachable
+                | MirTerminator::Placeholder => None,
+            };
+            if let Some(t) = new_terminator {
+                block.terminator = t;
+            }
+        }
+
+        // 被删块名下的 Phi incoming 丢弃，其余前驱 id 跟着换。
+        Self::remap_phi_preds(&mut self.blocks, &id_map);
+
+        // 丢掉被删前驱之后只剩一条 incoming 的 Phi，等价于一次普通赋值，
+        // 直接退化成 Use。0 条 incoming 的 Phi 原样留着，不悄悄删掉定义：
+        // 一个保留下来的块必然至少有一个保留下来的前驱，走到 0 说明输入本来
+        // 就是畸形的，留着让后面的一致性检查看得见，比静默删除更容易定位。
+        for block in self.blocks.iter_mut() {
+            for stmt in block.stmts.iter_mut() {
+                if let MirStmt::Assign { value, .. } = stmt {
+                    let mut single: Option<MirOperand> = None;
+                    if let MirRvalue::Phi { values } = &*value {
+                        if values.len() == 1 {
+                            single = Some(values[0].1.clone());
+                        }
+                    }
+                    if let Some(op) = single {
+                        *value = MirRvalue::Use(op);
+                    }
+                }
+            }
+        }
+
+        // 删块 + 重编号：所有按块编号索引的分析快照作废。
+        self.bump_revision();
+
+        true
+    }
 }

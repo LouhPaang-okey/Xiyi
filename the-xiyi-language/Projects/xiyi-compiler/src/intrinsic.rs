@@ -281,15 +281,16 @@ fn build_fn_table() -> [Option<Intrinsic>; FN_COUNT] {
     });
 
     // ---- 张量算子（签名复杂，由 sema 检查） ----
+    // 关键修复：is_pure 的含义是"结果没被使用时整条调用可以删，两次相同
+    // 调用可以合并成一次"（见 detect::call_purity、GVN）。下面这批算子满足；
+    // Reshape 和 Dropout 不满足，单独列在后面，不能跟它们放在同一个循环里。
     for (name, link_name, doc) in [
         (IntrinsicFn::Embedding, "xiyi_math::embedding", "Embedding lookup"),
         (IntrinsicFn::Linear, "xiyi_math::linear", "Linear transformation"),
         (IntrinsicFn::Conv2d, "xiyi_math::conv2d", "2D convolution"),
         (IntrinsicFn::MaxPool2d, "xiyi_math::max_pool2d", "2D max pooling"),
         (IntrinsicFn::Flatten, "xiyi_math::flatten", "Flatten tensor"),
-        (IntrinsicFn::Reshape, "xiyi_math::reshape", "Reshape tensor"),
         (IntrinsicFn::Relu, "xiyi_math::relu", "ReLU activation"),
-        (IntrinsicFn::Dropout, "xiyi_math::dropout", "Dropout"),
         (IntrinsicFn::LayerNorm, "xiyi_math::layer_norm", "Layer normalization"),
         (IntrinsicFn::Sum, "xiyi_math::sum", "Sum reduction"),
     ] {
@@ -303,6 +304,32 @@ fn build_fn_table() -> [Option<Intrinsic>; FN_COUNT] {
             doc,
         });
     }
+
+    // Reshape：目标形状跟输入元素总数对不上时在运行时 panic（形状检查，见
+    // check_reshape，只能在静态形状已知时提前拦住）。panic 是可观察行为，
+    // 结果没被使用时整条删掉会吞掉这次 panic，所以不是 pure。
+    insert(IntrinsicFn::Reshape, Intrinsic {
+        kind: IntrinsicKind::Function,
+        allowed_in_model: true,
+        is_pure: false,
+        requires_unsafe: false,
+        signature: None,
+        link_name: "xiyi_math::reshape",
+        doc: "Reshape tensor",
+    });
+
+    // Dropout：训练模式下按随机掩码丢弃元素，每次调用结果不同、还会推进
+    // 随机数状态——相同参数的两次调用不是同一个值（GVN 不能合并），丢弃
+    // 一次调用也会改变后续随机数序列（死代码消除不能删）。
+    insert(IntrinsicFn::Dropout, Intrinsic {
+        kind: IntrinsicKind::Function,
+        allowed_in_model: true,
+        is_pure: false,
+        requires_unsafe: false,
+        signature: None,
+        link_name: "xiyi_math::dropout",
+        doc: "Dropout",
+    });
 
     arr
 }

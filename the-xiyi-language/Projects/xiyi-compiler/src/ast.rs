@@ -427,7 +427,10 @@ pub enum ExprKind {
 // 写法要对着 &UnaryOp 解引用取值，没有 Copy 编译不过（E0507）。纯枚举、
 // 不带数据，加 Copy 完全安全，不影响任何已有用法（Copy 类型依然可以
 // 正常 .clone()）。
-#[derive(Debug, PartialEq, Clone, Copy)]
+// 关键新增：补上 Eq/Hash——GVN 的表达式 key（analyze.rs 的 ExprKey）要把
+// 运算符本身放进 HashMap 的 key 里。纯枚举、不带数据、没有浮点，派生
+// 这两个 trait 没有任何副作用。
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -475,7 +478,8 @@ pub enum Literal {
 }
 
 // 关键修复：同 UnaryOp，补 Copy——simplify.rs 里 *op 解引用取值需要。
-#[derive(Debug, PartialEq, Clone, Copy)]
+// 同 UnaryOp：补 Eq/Hash 供 GVN 的 ExprKey 使用。
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -493,7 +497,11 @@ pub enum BinaryOp {
 }
 
 // ===== 类型系统（完整版本） =====
-#[derive(Debug, PartialEq, Clone)]
+// 关键新增：补上 Eq/Hash——GVN 的表达式 key（analyze.rs 的 ExprKey）里 Cast
+// 和 Call 要带 Type。逐个核对过所有变体：只有整数/String/usize/bool/Vec/Box
+// 以及 ShapeDim、PrivacyTag（同样补了 Eq/Hash），没有任何浮点字段，F16/F32/
+// F64 是 unit 变体，所以派生是安全的。
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Type {
     // 有符号整数
     I8, I16, I32, I64, I128,
@@ -614,7 +622,7 @@ impl Type {
 }
 
 // ===== 隐私标签 =====
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum PrivacyTag {
     Public,
     Private,
@@ -622,7 +630,7 @@ pub enum PrivacyTag {
 }
 
 // ===== 形状维度 =====
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum ShapeDim {
     Const(usize),
     Sym(String),

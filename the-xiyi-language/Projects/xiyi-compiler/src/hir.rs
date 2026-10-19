@@ -36,6 +36,21 @@ impl EffectSet {
         self.has_ffi |= other.has_ffi;
         self.has_panic |= other.has_panic;
     }
+
+    // 关键新增：所有副作用标志位都是 false 才算"干净"。has_panic 也算
+    // 副作用——一个可能 panic 的调用就算结果没人用也不能删，因为 panic
+    // 的异常传播会跳过后面的 Drop，是可观察行为。
+    //
+    // 跟 merge/merge_with 收在同一个 impl 里是有意的：EffectSet 再加
+    // 一个 has_xxx 字段时，这三个函数必须一起改，放在一起才不容易漏。
+    //
+    // 注意这个函数只回答"这份 EffectSet 里记了没有副作用"，不保证
+    // EffectSet 本身记全了：hir_builder.rs 目前只有字面函数名是 print 的
+    // 调用才会置 has_io，调用别的函数并不会合并被调函数的 effects（见
+    // analyze.rs::compute_purity_table 里对这一点的处理）。
+    pub fn is_pure(&self) -> bool {
+        !self.has_io && !self.has_rng && !self.has_ai && !self.has_ffi && !self.has_panic
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
