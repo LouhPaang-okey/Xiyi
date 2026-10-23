@@ -1,4 +1,4 @@
-# 希夷编译器测试套件
+# 希夷语言编译器测试套件
 # run_all_tests.sh
 #
 # 依赖:
@@ -6,12 +6,17 @@
 #   jq  (仅当存在 Tests/list.json 时需要)
 #
 # 平台:
-#   仅支持 64 位 Linux 与 macOS；Windows (含 Git Bash / MSYS / Cygwin) 请使用 run_all_tests.ps1。
+#   只支持 64 位的 Linux，MacOS 也行。
+#   Windows 请用 run_all_tests.ps1，
+#   MacOS 请用 run_all_tests.zsh，
+#   Solaris/illumos 请用 run_all_tests.ksh，
+#
 #   位数以 getconf LONG_BIT 报告的用户空间位数为准，getconf 不可用时退回 uname -m 白名单:
 #     x86_64 / amd64 / aarch64 / arm64 / riscv64 / ppc64 / ppc64le / s390x /
 #     mips64 / mips64el / loongarch64
-#   32 位 (i686、armv7l 等) 会被脚本主动拒绝。
-#   仅调试脚本本身时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (bash 版本检查不可跳过)。
+#   32 位一律拒绝。
+#
+#   仅在调试脚本时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (bash 版本检查不可跳过)。
 #
 # .exit golden 两边都只接受 0-255 (POSIX 退出码范围)，保证仓库里共享的 golden 在两个平台含义一致。
 # 与 run_all_tests.ps1 的语义保持基本一致 (参数、过滤、golden、超时、JSON 字段)；
@@ -30,15 +35,15 @@ if [ "${XIYI_TESTS_FORCE:-0}" != "1" ]; then
         Linux|Darwin) ;;
         *)
             echo "❌ 不支持的操作系统: $(uname -s 2>/dev/null || echo unknown)" >&2
-            echo "   本脚本只支持 Linux 与 macOS；Windows 请使用 run_all_tests.ps1。" >&2
+            echo "   此脚本只支持 Linux 与 MacOS。" >&2
             exit 1
             ;;
     esac
 fi
 if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 3) )); then
     echo "❌ 需要 bash >= 5.3，当前 $BASH_VERSION" >&2
-    echo "   macOS: brew install bash，并用新 bash 运行 (自带的是 3.2)。" >&2
-    echo "   Linux: 请从发行版仓库 / 源码安装 bash 5.3 或更新版本。" >&2
+    echo "   MacOS: 请先 brew install bash 之后，再来运行。" >&2
+    echo "   Linux: 请从发行版仓库安装 bash 5.3，或自行更新版本。" >&2
     exit 1
 fi
 

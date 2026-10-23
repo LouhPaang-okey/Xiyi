@@ -1,17 +1,17 @@
-﻿# 希夷编译器测试套件
+﻿# 希夷语言编译器测试套件
 # run_all_tests.ps1
 #
-# 要求:
-#   - 64 位 Windows + 64 位 PowerShell，PowerShell >= 7.6.6 (低于此版本直接退出)
-#   - cargo (除非 -SkipBuild)
+# 依赖:
+#   PowerShell >= 7.6.6 (低于此版本直接退出)，cargo
 #
 # 平台:
-#   只能在 Windows 上运行；Linux/macOS 请使用 run_all_tests.sh。
-#   32 位操作系统或 32 位 PowerShell 进程会被脚本主动拒绝。
-#   仅调试脚本本身时，可设环境变量 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检
-#   (PowerShell 版本检查不可跳过)。
+#   只支持 64 位的 Windows。
+#   Linux 请用 run_all_tests.sh，
+#   MacOS 请用 run_all_tests.zsh，
+#   Solaris/illumos 请用 run_all_tests.ksh，
+#   32 位一律拒绝。
 #
-# 与 run_all_tests.sh 的语义保持基本一致 (参数、过滤、golden、超时、JSON 字段)。
+#   仅在调试脚本时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (PowerShell 版本检查不可跳过)。
 #
 # 多值参数 (-Name -NameRegex -Exclude -Tag) 的写法 —— 与 sh 版的"重复 --name"不同，这是 PowerShell 的限制:
 #   在 PowerShell 会话里，或用 pwsh -Command:   -Name 'lexer/*','parser/*'
@@ -23,9 +23,6 @@
 # 平台细节差异: sh 以"信号 / 退出码 > 128"识别崩溃，这里以 NTSTATUS 错误码
 # (0xC0000000-0xC000FFFF，如访问违例、栈溢出) 识别；超时由 WaitForExit 直接判定，
 # 不依赖退出码。
-#
-# 注意: 为了让低版本 PowerShell 也能"解析通过并走到下面的版本检查、给出友好提示"，
-# 本文件在版本检查之前不使用任何 PowerShell 7 才有的语法 (三元、??、&& 等)。
 
 param(
     [ValidateSet('all', 'pass', 'fail')]
