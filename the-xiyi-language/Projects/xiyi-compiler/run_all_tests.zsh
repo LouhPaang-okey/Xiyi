@@ -15,6 +15,9 @@
 #
 #   仅在调试脚本时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (zsh 版本检查不可跳过)。
 #
+# 命令:
+#   zsh run_all_tests.zsh
+#
 # .exit golden 与其它版本一致，只接受 0-255。
 
 if [ -z "${ZSH_VERSION:-}" ]; then

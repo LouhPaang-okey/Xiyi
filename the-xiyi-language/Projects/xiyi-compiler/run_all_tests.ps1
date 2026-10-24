@@ -13,6 +13,9 @@
 #
 #   仅在调试脚本时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (PowerShell 版本检查不可跳过)。
 #
+# 命令:
+#   pwsh -File run_all_tests.ps1
+#
 # 多值参数 (-Name -NameRegex -Exclude -Tag) 的写法 —— 与 sh 版的"重复 --name"不同，这是 PowerShell 的限制:
 #   在 PowerShell 会话里，或用 pwsh -Command:   -Name 'lexer/*','parser/*'
 #   用 pwsh -File 时，逗号不会被拆分、同名参数也不能重复，每个选项只能给一个值。

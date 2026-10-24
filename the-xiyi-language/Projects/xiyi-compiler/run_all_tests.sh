@@ -18,11 +18,12 @@
 #
 #   仅在调试脚本时，可设 XIYI_TESTS_FORCE=1 跳过操作系统与位数自检 (bash 版本检查不可跳过)。
 #
+# 命令:
+#   bash run_all_tests.sh
+#
 # .exit golden 两边都只接受 0-255 (POSIX 退出码范围)，保证仓库里共享的 golden 在两个平台含义一致。
 # 与 run_all_tests.ps1 的语义保持基本一致 (参数、过滤、golden、超时、JSON 字段)；
 # 两者的平台细节差异 (信号 vs NTSTATUS 崩溃码等) 见各自的注释。
-#
-# macOS: brew install bash coreutils jq，然后用新 bash 运行。
 
 # ---- 解释器自检(必须用 POSIX 语法写，因为此时可能还在 dash 里) ----
 if [ -z "${BASH_VERSION:-}" ]; then
